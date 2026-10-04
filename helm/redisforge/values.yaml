@@ -1,0 +1,9 @@
+image:
+  repository: redisforge
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  port: 6379
+  nodePort: 30007

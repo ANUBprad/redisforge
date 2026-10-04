@@ -1,0 +1,14 @@
+*.jar
+target/
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+*.log
+.env
+*.pem
+*.key
+helm-*.tgz
+.DS_Store

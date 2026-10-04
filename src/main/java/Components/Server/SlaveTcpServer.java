@@ -10,16 +10,14 @@ import Components.Service.ResponseDto;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -83,14 +81,10 @@ public class SlaveTcpServer {
         try(Socket master = new Socket(redisConfig.getMasterHost(), redisConfig.getMasterPort())){
             InputStream inputStream = master.getInputStream();
             OutputStream outputStream = master.getOutputStream();
-            byte[] inputBuffer = new byte[1024];
 
             //part 1 of the handshake
-            byte[] data = "*1\r\n$4\r\nPING\r\n".getBytes();
-            outputStream.write(data);
-            int bytesRead = inputStream.read(inputBuffer,0,inputBuffer.length);
-            String response = new String(inputBuffer,0,bytesRead, StandardCharsets.UTF_8);
-            logger.log(Level.FINE, response);
+            outputStream.write("*1\r\n$4\r\nPING\r\n".getBytes());
+            logger.log(Level.FINE, readLine(inputStream));
 
             //part 2 of the handshake
             int lenListeningPort = (redisConfig.getPort()+"").length();
@@ -98,88 +92,86 @@ public class SlaveTcpServer {
             String replconf = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$" +
                     (lenListeningPort+"") + "\r\n" + (listeningPort+"") +
                     "\r\n";
-            data = replconf.getBytes();
-            outputStream.write(data);
-            bytesRead = inputStream.read(inputBuffer,0,inputBuffer.length);
-            response = new String(inputBuffer,0,bytesRead, StandardCharsets.UTF_8);
-            logger.log(Level.FINE, response);
+            outputStream.write(replconf.getBytes());
+            logger.log(Level.FINE, readLine(inputStream));
 
             replconf = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
-            data = replconf.getBytes();
-            outputStream.write(data);
-            bytesRead = inputStream.read(inputBuffer,0,inputBuffer.length);
-            response = new String(inputBuffer,0,bytesRead, StandardCharsets.UTF_8);
-            logger.log(Level.FINE, response);
+            outputStream.write(replconf.getBytes());
+            logger.log(Level.FINE, readLine(inputStream));
 
             // part 3 of the handshake
-            String psync = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
-            data = psync.getBytes();
-            outputStream.write(data);
+            outputStream.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".getBytes());
+            readFullResync(inputStream);
 
-            List<Integer> res = handlePsyncResponse(inputStream);
-
-            // number of bytes in the input stream coming down from the master after this point, if they are read and the command is proccessed we can add
-            // the number of bytes processes to the offset
-
-            while(master.isConnected()){
-                int offset = 1;
-                StringBuilder sb = new StringBuilder();
-                List<Byte> bytes = new ArrayList<>();
-
-                while(true){
-                    int b = inputStream.read();
-                    if(b=='*'){
-                        break;
-                    }
-                    offset++;
-                    bytes.add((byte)b);
-                    if(inputStream.available()<=0){
-                        break;
-                    }
-                }
-
-                for(Byte b: bytes){
-                    sb.append((char)(b.byteValue() & 0xFF));
-                }
-
-                if(bytes.isEmpty())
-                    continue;
-                String command = sb.toString();
-                String parts[] = command.split("\r\n");
-
-                if(command.equals("+OK\r\n"))
-                    continue;
-
-
-                String[] commandArray = respSerializer.parseArray(parts);
-                Client masterClient = new Client(master, master.getInputStream(), master.getOutputStream(), -1);
-                String commandResult = handleCommandFromMaster(commandArray, masterClient);
-
-                if(commandArray.length >= 2 && commandArray[0].equals("REPLCONF") && commandArray[1].equals("GETACK")){
-                    if(!commandResult.equals("") && commandResult!=null)
-                        outputStream.write(commandResult.getBytes());
-                    offset++;
-                    List<Byte> leftOverBytes = new ArrayList<>();
-                    while(true){
-                        if(inputStream.available()<=0)
-                            break;
-                        byte b = (byte)inputStream.read();
-                        leftOverBytes.add(b);
-                        if((int) b == (int)'*')
-                            break;
-                        offset++;
-                    }
-                    StringBuilder leftOverSb = new StringBuilder();
-                    for(Byte b: leftOverBytes){
-                        leftOverSb.append((char)(b.byteValue() & 0xFF));
-                    }
-                }
-                redisConfig.setMasterReplOffset(offset + redisConfig.getMasterReplOffset());
-            }
-
+            streamFromMaster(new Client(master, inputStream, outputStream, -1));
         } catch (Exception e) {
             logger.log(Level.SEVERE, e.getMessage());
         }
+    }
+
+    /**
+     * Applies the commands the master streams down once the RDB payload is out of the way.
+     * The upstream is framed exactly the way a client's is: only whole RESP arrays are
+     * decoded, in arrival order, and a partly received array waits for the rest of it
+     * instead of being read as if the socket had ended a message there.
+     */
+    void streamFromMaster(Client master) throws IOException {
+        RespStream replicated = new RespStream(respSerializer);
+        byte[] buffer = new byte[8192];
+        int bytesRead;
+        while ((bytesRead = master.inputStream.read(buffer)) != -1) {
+            replicated.append(buffer, bytesRead);
+            for (String[] command : replicated.drain()) {
+                String response = handleCommandFromMaster(command, master);
+                if(response != null && !response.isEmpty())
+                    master.outputStream.write(response.getBytes());
+                // the master counts a command by the bytes it occupies, so ack the same
+                redisConfig.setMasterReplOffset(redisConfig.getMasterReplOffset()
+                        + respSerializer.respArray(command).getBytes().length);
+            }
+        }
+    }
+
+    /**
+     * Consumes the answer to PSYNC: the "+FULLRESYNC" status line, the header of the RDB
+     * bulk string behind it, and exactly as many payload bytes as that header declares.
+     * This master sends no CRLF after the payload, so the first replicated command picks
+     * up on the very next byte.
+     */
+    private void readFullResync(InputStream inputStream) throws IOException {
+        String status = readLine(inputStream);
+        if(status == null || !status.startsWith("+FULLRESYNC")){
+            throw new IOException("expected +FULLRESYNC from the master but read: " + status);
+        }
+        logger.log(Level.FINE, status);
+
+        String header = readLine(inputStream);
+        if(header == null || !header.startsWith("$")){
+            throw new IOException("expected the length of the RDB but read: " + header);
+        }
+        int rdbLength = Integer.parseInt(header.substring(1));
+
+        // the RDB is raw bytes, so it is counted off rather than scanned for a delimiter
+        byte[] rdb = inputStream.readNBytes(rdbLength);
+        if(rdb.length != rdbLength){
+            throw new EOFException("the RDB ended after " + rdb.length + " of " + rdbLength + " bytes");
+        }
+    }
+
+    /** Reads one CRLF terminated line, or null once the master has hung up. */
+    private String readLine(InputStream inputStream) throws IOException {
+        StringBuilder line = new StringBuilder();
+        int b;
+        while ((b = inputStream.read()) != -1) {
+            if(b == '\r'){
+                if(inputStream.read() != '\n'){
+                    throw new IOException("expected LF after CR");
+                }
+                return line.toString();
+            }
+            line.append((char) b);
+        }
+        return line.length() == 0 ? null : line.toString();
     }
 
     private String handleCommandFromMaster(String[] command, Client master) {
@@ -220,20 +212,6 @@ public class SlaveTcpServer {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private List<Integer> handlePsyncResponse(InputStream inputStream) throws IOException {
-        List<Integer> res = new ArrayList<>();
-        while(true){
-            if(inputStream.available() <= 0)
-                continue;
-            int b = inputStream.read();
-            res.add(b);
-            if(b == (int)'*') {
-                break;
-            }
-        }
-        return res;
     }
 
     private void handleClient(Client client) throws IOException {

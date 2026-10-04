@@ -18,6 +18,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -125,9 +126,13 @@ public class SlaveTcpServer {
                 String response = handleCommandFromMaster(command, master);
                 if(response != null && !response.isEmpty())
                     master.outputStream.write(response.getBytes());
-                // the master counts a command by the bytes it occupies, so ack the same
-                redisConfig.setMasterReplOffset(redisConfig.getMasterReplOffset()
-                        + respSerializer.respArray(command).getBytes().length);
+                if(!isReplicationControlCommand(command[0])){
+                    // the offset follows the write stream only, because that is what the
+                    // sending side counted; a control frame is not part of it, so an ACK
+                    // from here compares equal against the master's own count
+                    redisConfig.setMasterReplOffset(redisConfig.getMasterReplOffset()
+                            + respSerializer.respArray(command).getBytes().length);
+                }
             }
         }
     }
@@ -174,6 +179,11 @@ public class SlaveTcpServer {
         return line.length() == 0 ? null : line.toString();
     }
 
+    /** Replication plumbing: consumed on the way in, never applied and never counted. */
+    private boolean isReplicationControlCommand(String command) {
+        return command.equalsIgnoreCase("REPLCONF");
+    }
+
     private String handleCommandFromMaster(String[] command, Client master) {
         System.out.println("================================= received command from master =================================");
         for(String c: command){
@@ -189,7 +199,9 @@ public class SlaveTcpServer {
                 String commandRespString = respSerializer.respArray(command);
                 byte[] toCount = commandRespString.getBytes();
                 connectionPool.bytesSentToSlaves += toCount.length;
-                CompletableFuture.runAsync(()->propagate(command));
+                // straight down the same thread, so a replica sees the writes in the order
+                // it received them from upstream
+                propagate(command);
                 break;
             case "REPLCONF":
                 res = commandHandler.replconf(command, master);
@@ -200,17 +212,21 @@ public class SlaveTcpServer {
 
     private void propagate(String[] command) {
         String commandRespString = respSerializer.respArray(command);
-        try{
-            for(Slave slave: connectionPool.getSlaves()){
-                System.out.println("========================= sending command down to slave ==============================");
-                System.out.println("command: "+commandRespString);
-                System.out.println(slave.connection.id);
-                InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-                System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
+        // a copy, because a replica that cannot be written to is dropped on the way past
+        for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            System.out.println("========================= sending command down to slave ==============================");
+            System.out.println("command: "+commandRespString);
+            System.out.println(slave.connection.id);
+            InetAddress remoteAddress = slave.connection.socket.getInetAddress();
+            System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
+            try {
                 slave.send(commandRespString.getBytes());
+            } catch (IOException e) {
+                // propagation runs on the upstream loop's thread, so a downstream replica
+                // that stops reading must not be allowed to break that loop
+                logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
+                connectionPool.removeSlave(slave);
             }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -263,6 +279,11 @@ public class SlaveTcpServer {
                 ResponseDto resDto = commandHandler.psync(command);
                 res = resDto.response;
                 data = resDto.data;
+                break;
+            case "REPLCONF":
+                // a replica runs the same handshake as a master, which is what lets it be
+                // the upstream master of another replica
+                res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
                 if(connectionPool.bytesSentToSlaves == 0){

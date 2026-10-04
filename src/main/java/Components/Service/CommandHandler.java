@@ -13,10 +13,10 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -152,21 +152,19 @@ public class CommandHandler {
         String[] getackarr = new String[] { "REPLCONF", "GETACK", "*" };
         String getack = respSerializer.respArray(getackarr);
         byte[] bytearr = getack.getBytes();
-        int bufferSize = bytearr.length;
 
         int required = Integer.parseInt(command[1]);
         int time = Integer.parseInt(command[2]);
 
-        for(Slave slave: connectionPool.getSlaves()){
-            CompletableFuture.runAsync(()->{
-                try {
-
-                    slave.connection.send(getack.getBytes());
-                } catch (IOException e) {
-                    e.printStackTrace();
-                    throw new RuntimeException(e);
-                }
-            });
+        // straight down the thread that is waiting, so a replica cannot answer this
+        // GETACK before the writes that were propagated ahead of it
+        for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            try {
+                slave.connection.send(bytearr);
+            } catch (IOException e) {
+                logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
+                connectionPool.removeSlave(slave);
+            }
         }
 
         int res = 0;
@@ -177,7 +175,8 @@ public class CommandHandler {
                 break;
             res= connectionPool.slavesThatAreCaughtUp;
         }
-        connectionPool.bytesSentToSlaves+=bufferSize;
+        // bytesSentToSlaves counts replicated writes only. Folding the GETACK into it would
+        // push it past the offset a replica reports back, and the next ACK would never match
         if(res > required)
             return respSerializer.respInteger(required);
         return respSerializer.respInteger(res);

@@ -19,6 +19,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -141,7 +142,7 @@ public class MasterTcpServer {
                     String commandRespString = respSerializer.respArray(commandToPropagate);
                     byte[] toCount = commandRespString.getBytes();
                     connectionPool.bytesSentToSlaves += toCount.length;
-                    CompletableFuture.runAsync(()->propagate(commandToPropagate));
+                    propagate(commandToPropagate);
                 }
 
                 String response = respSerializer.respArray(client.transactionResponse);
@@ -197,7 +198,8 @@ public class MasterTcpServer {
                 String commandRespString = respSerializer.respArray(command);
                 byte[] toCount = commandRespString.getBytes();
                 connectionPool.bytesSentToSlaves += toCount.length;
-                CompletableFuture.runAsync(()->propagate(command));
+                // on this thread, so replicas receive writes in the order they arrived
+                propagate(command);
                 break;
             case "GET":
                 res = commandHandler.get(command);
@@ -229,18 +231,22 @@ public class MasterTcpServer {
 
     private void propagate(String[] command) {
         String commandRespString = respSerializer.respArray(command);
-        try{
-            for(Slave slave: connectionPool.getSlaves()){
-                System.out.println("========================= sending command down to slave ==============================");
-                System.out.println("command: "+commandRespString);
-                System.out.println(slave.connection.id);
-                InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-                System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
+        // a copy, because a replica that cannot be written to is dropped on the way past
+        for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            System.out.println("========================= sending command down to slave ==============================");
+            System.out.println("command: "+commandRespString);
+            System.out.println(slave.connection.id);
+            InetAddress remoteAddress = slave.connection.socket.getInetAddress();
+            System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
 
+            try {
                 slave.send(commandRespString.getBytes());
+            } catch (IOException e) {
+                // propagation runs on the connection's thread, so a replica that stops
+                // reading must not be allowed to break that connection
+                logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
+                connectionPool.removeSlave(slave);
             }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
     }
 }

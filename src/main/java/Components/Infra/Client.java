@@ -62,6 +62,23 @@ public class Client {
             outputStream.write(res.data);
     }
 
+    public void close() {
+        if(transactionalContext){
+            endTransaction();
+        }
+        closeQuietly(inputStream);
+        closeQuietly(outputStream);
+        closeQuietly(socket);
+    }
+
+    private static void closeQuietly(AutoCloseable closeable){
+        try {
+            closeable.close();
+        } catch (Exception e) {
+            // the connection is being torn down, there is nothing left to recover
+        }
+    }
+
     public void send(byte[] data) throws IOException {
         if(data!=null)
             outputStream.write(data);

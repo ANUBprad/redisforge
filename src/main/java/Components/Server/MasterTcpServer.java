@@ -80,21 +80,29 @@ public class MasterTcpServer {
     }
     private void handleClient(Client client) throws IOException {
         connectionPool.addClient(client);
-        while(client.socket.isConnected()){
+        try {
             byte[] buffer = new byte[client.socket.getReceiveBufferSize()];
-            int bytesRead = client.inputStream.read(buffer);
+            int bytesRead;
+            // read() blocks until data arrives; it returns -1 once the peer has
+            // disconnected, which is what ends this loop. isConnected() is not a
+            // liveness check - it stays true forever after the peer goes away.
+            while ((bytesRead = client.inputStream.read(buffer)) != -1) {
+                if (bytesRead > 0) {
+                    // bytes parsing into strings
+                    List<String[]> commands = respSerializer.deseralize(buffer);
 
-            if(bytesRead > 0){
-                // bytes parsing into strings
-                List<String[]> commands = respSerializer.deseralize(buffer);
-
-                for(String[] command :commands){
-                    handleCommand(command, client);
+                    for (String[] command : commands) {
+                        handleCommand(command, client);
+                    }
                 }
             }
+        } finally {
+            // runs for a normal disconnect and for an I/O failure alike, so the
+            // registries never keep a dead connection around
+            connectionPool.removeClient(client);
+            connectionPool.removeSlave(client);
+            client.close();
         }
-        connectionPool.removeClient(client);
-        connectionPool.removeSlave(client);
     }
 
     private void handleCommand(String[] command, Client client) throws IOException {

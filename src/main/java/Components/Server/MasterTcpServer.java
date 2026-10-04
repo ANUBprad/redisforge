@@ -7,6 +7,7 @@ import Components.Repository.Value;
 import Components.Service.CommandHandler;
 import Components.Service.RespSerializer;
 import Components.Infra.Client;
+import Components.Infra.RespStream;
 import Components.Service.ResponseDto;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -80,6 +81,7 @@ public class MasterTcpServer {
     }
     private void handleClient(Client client) throws IOException {
         connectionPool.addClient(client);
+        RespStream respStream = new RespStream(respSerializer);
         try {
             byte[] buffer = new byte[client.socket.getReceiveBufferSize()];
             int bytesRead;
@@ -87,13 +89,11 @@ public class MasterTcpServer {
             // disconnected, which is what ends this loop. isConnected() is not a
             // liveness check - it stays true forever after the peer goes away.
             while ((bytesRead = client.inputStream.read(buffer)) != -1) {
-                if (bytesRead > 0) {
-                    // bytes parsing into strings
-                    List<String[]> commands = respSerializer.deseralize(buffer);
-
-                    for (String[] command : commands) {
-                        handleCommand(command, client);
-                    }
+                // a read is not a command: respStream keeps a partial frame until
+                // the rest of it arrives, and splits out every whole one
+                respStream.append(buffer, bytesRead);
+                for (String[] command : respStream.drain()) {
+                    handleCommand(command, client);
                 }
             }
         } finally {

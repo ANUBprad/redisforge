@@ -48,4 +48,35 @@ class RespSerializerTest {
         assertEquals("key", commands.get(1)[1]);
         assertEquals("value", commands.get(1)[2]);
     }
+
+    @Test
+    public void testFrameLengthIsIncompleteUntilTheWholeArrayArrives(){
+        String frame = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        byte[] bytes = frame.getBytes(StandardCharsets.UTF_8);
+
+        // however the stream is cut up, no prefix may look like a whole frame
+        for(int prefix = 0; prefix < bytes.length; prefix++){
+            assertEquals(RespSerializer.INCOMPLETE_FRAME, respSerializer.frameLength(bytes, 0, prefix),
+                    "a frame of " + prefix + " bytes was taken for a whole array");
+        }
+        assertEquals(bytes.length, respSerializer.frameLength(bytes, 0, bytes.length));
+    }
+
+    @Test
+    public void testFrameLengthStopsAtTheFirstOfSeveralFrames(){
+        String twoFrames = "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
+        byte[] bytes = twoFrames.getBytes(StandardCharsets.UTF_8);
+        int first = "*1\r\n$4\r\nPING\r\n".length();
+
+        assertEquals(first, respSerializer.frameLength(bytes, 0, bytes.length));
+        assertEquals(first, respSerializer.frameLength(bytes, first, bytes.length));
+    }
+
+    @Test
+    public void testFrameLengthRejectsBytesThatAreNotResp(){
+        assertEquals(RespSerializer.MALFORMED_FRAME,
+                respSerializer.frameLength("hello\r\n".getBytes(StandardCharsets.UTF_8), 0, 7));
+        assertEquals(RespSerializer.MALFORMED_FRAME,
+                respSerializer.frameLength("*3\r\n?3\r\nSET\r\n".getBytes(StandardCharsets.UTF_8), 0, 16));
+    }
 }

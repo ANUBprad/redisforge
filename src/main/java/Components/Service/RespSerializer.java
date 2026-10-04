@@ -11,6 +11,12 @@ import java.util.logging.Logger;
 @Component
 public class RespSerializer {
     private static final Logger logger = Logger.getLogger(RespSerializer.class.getName());
+
+    /** returned by {@link #frameLength} when the bytes so far do not hold a whole array yet */
+    public static final int INCOMPLETE_FRAME = -1;
+    /** returned by {@link #frameLength} when the bytes cannot be the start of an array */
+    public static final int MALFORMED_FRAME = -2;
+
     public String serializeBulkString(String s){
         int length = s.length();
         String respHeader = "$"+length;
@@ -31,20 +37,109 @@ public class RespSerializer {
                     i++;
                 }
                 i+=2;
-                String part = "";
+                StringBuilder part = new StringBuilder();
                 for(int k=0; k<Integer.parseInt(partLength);k++){
-                    part+=dataArr[i++];
+                    part.append(dataArr[i++]);
                 }
                 i+=2;
-                subArray[j++]=part;
+                subArray[j++]=part.toString();
             }
         }
         return i;
     }
 
+    /**
+     * Counts how many bytes the RESP array starting at {@code from} occupies.
+     * An array is <code>*count\r\n</code> followed by that many
+     * <code>$length\r\npayload\r\n</code> bulk strings.
+     *
+     * @return the length of the array in bytes, {@link #INCOMPLETE_FRAME} when the
+     *         bytes received so far stop in the middle of one, or {@link #MALFORMED_FRAME}
+     *         when they cannot be the start of an array at all
+     */
+    public int frameLength(byte[] data, int from, int to){
+        if(from >= to){
+            return INCOMPLETE_FRAME;
+        }
+        if(data[from] != '*'){
+            return MALFORMED_FRAME;
+        }
+
+        int lineEnd = endOfLengthLine(data, from + 1, to);
+        if(lineEnd < 0){
+            return lineEnd;
+        }
+        int elements = parseLength(data, from + 1, lineEnd);
+
+        int i = lineEnd + 2;
+        for(int element = 0; element < elements; element++){
+            if(i >= to){
+                return INCOMPLETE_FRAME;
+            }
+            if(data[i] != '$'){
+                return MALFORMED_FRAME;
+            }
+
+            lineEnd = endOfLengthLine(data, i + 1, to);
+            if(lineEnd < 0){
+                return lineEnd;
+            }
+            i = lineEnd + 2 + parseLength(data, i + 1, lineEnd);
+            if(i + 1 >= to){
+                return INCOMPLETE_FRAME;
+            }
+            if(data[i] != '\r' || data[i + 1] != '\n'){
+                return MALFORMED_FRAME;
+            }
+            i += 2;
+        }
+        return i - from;
+    }
+
+    /**
+     * Finds the '\r' closing a length header that starts at {@code from}, so the number
+     * itself is data[from, result). Returns a negative {@link #frameLength} status.
+     */
+    private int endOfLengthLine(byte[] data, int from, int to){
+        int i = from;
+        while(i < to && data[i] != '\r'){
+            if(data[i] < '0' || data[i] > '9'){
+                return MALFORMED_FRAME;
+            }
+            i++;
+        }
+        if(i == to){
+            return INCOMPLETE_FRAME;
+        }
+        if(i == from){
+            return MALFORMED_FRAME;
+        }
+        if(i + 1 >= to){
+            return INCOMPLETE_FRAME;
+        }
+        return i;
+    }
+
+    private int parseLength(byte[] data, int from, int to){
+        int length = 0;
+        for(int i = from; i < to; i++){
+            length = length * 10 + (data[i] - '0');
+        }
+        return length;
+    }
+
     public List<String[]> deseralize(byte[] command){
+        return deseralize(command, 0, command.length);
+    }
+
+    /**
+     * Decodes the RESP arrays held in data[from, to). Callers must pass whole frames:
+     * trailing bytes that belong to the next array, or that have not arrived yet, are
+     * the caller's to keep.
+     */
+    public List<String[]> deseralize(byte[] command, int from, int to){
         try{
-            String data = new String(command, StandardCharsets.UTF_8);
+            String data = new String(command, from, to - from, StandardCharsets.UTF_8);
             char[] dataArr = data.toCharArray();
             List<String[]> res = new ArrayList<>();
 

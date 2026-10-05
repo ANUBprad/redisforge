@@ -3,6 +3,7 @@ package Components.Server;
 import Components.Infra.Client;
 import Components.Infra.ConnectionPool;
 import Components.Infra.Slave;
+import Components.Persistence.AppendOnlyPersistence;
 import Components.Repository.Store;
 import Components.Service.RespSerializer;
 import Config.AppConfig;
@@ -23,6 +24,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -30,7 +33,9 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -64,8 +69,11 @@ class ChainedReplicationTest {
     private Store store;
     @Autowired
     private RespSerializer respSerializer;
+    @Autowired
+    private AppendOnlyPersistence appendOnlyPersistence;
 
     private int replicaPort;
+    private Path replicaAppendOnlyFile;
 
     @BeforeAll
     void startReplica() throws Exception {
@@ -76,6 +84,12 @@ class ChainedReplicationTest {
         redisConfig.setPort(replicaPort);
         redisConfig.setMasterHost("127.0.0.1");
         redisConfig.setMasterPort(freePort());
+        // pointed at a path that must never appear, to catch a replica that wrote a file
+        replicaAppendOnlyFile = Files.createTempDirectory("chained-replica-aof")
+                .resolve("appendonly.aof");
+        Files.deleteIfExists(replicaAppendOnlyFile);
+        redisConfig.setAppendonly(true);
+        redisConfig.setAppendfilename(replicaAppendOnlyFile.toString());
         // one server for the whole class, on a thread of its own: startServer never
         // returns, so a server per test would pile up accept loops on the common pool and
         // starve the other test classes that start their servers the same way
@@ -325,6 +339,114 @@ class ChainedReplicationTest {
         }
     }
 
+    @Test
+    void aDeleteFromTheMasterIsAppliedAndPassedOnExactlyOnce() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:delete");
+
+            feed(frame("SET", "chain:delete", "value"), frame("DEL", "chain:delete"));
+
+            assertNull(store.getValue("chain:delete"),
+                    "the replica still holds a key its master deleted");
+            // the delete has to travel on as well, or a replica of this one keeps the key
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(2, received.size(), "the delete was not passed on once: " + received);
+            assertArrayEquals(new String[]{"SET", "chain:delete", "value"}, received.get(0));
+            assertArrayEquals(new String[]{"DEL", "chain:delete"}, received.get(1));
+        }
+    }
+
+    @Test
+    void theDeletesOfATransactionAreAppliedInOrderAndPassedOn() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            for (String key : List.of("chain:tx-a", "chain:tx-b")) {
+                store.map.remove(key);
+            }
+
+            // what a master sends after EXEC of MULTI / SET a 1 / SET b 2 / DEL a: the
+            // queued mutations as they were applied, not a MULTI block
+            feed(frame("SET", "chain:tx-a", "1"), frame("SET", "chain:tx-b", "2"),
+                    frame("DEL", "chain:tx-a"));
+
+            assertNull(store.getValue("chain:tx-a"),
+                    "the transaction's delete was not applied, so the replica is out of step");
+            assertEquals("2", store.getValue("chain:tx-b").val,
+                    "the transaction's surviving set was not applied");
+
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(3, received.size(), "the transaction was not passed on whole: " + received);
+            assertArrayEquals(new String[]{"SET", "chain:tx-a", "1"}, received.get(0));
+            assertArrayEquals(new String[]{"SET", "chain:tx-b", "2"}, received.get(1));
+            assertArrayEquals(new String[]{"DEL", "chain:tx-a"}, received.get(2));
+        }
+    }
+
+    @Test
+    void aDeleteOfAKeyThisReplicaNeverHadLeavesItInStepAndKeepsTheStreamAlive() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:never-existed");
+
+            // the delete is idempotent: a master that refused it for a missing key leaves
+            // this replica in exactly the state it is already in
+            feed(frame("DEL", "chain:never-existed"));
+
+            assertNull(store.getValue("chain:never-existed"));
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(1, received.size(), "the delete was not passed on: " + received);
+            assertArrayEquals(new String[]{"DEL", "chain:never-existed"}, received.get(0));
+
+            // and the stream is unharmed: the next write is still applied and passed on
+            feed(frame("SET", "chain:after-missing-delete", "fine"));
+            assertEquals("fine", store.getValue("chain:after-missing-delete").val,
+                    "a delete of a missing key disturbed the writes that followed it");
+            List<String[]> after = downstream.readFramesUntilAck();
+            assertEquals(1, after.size());
+            assertArrayEquals(new String[]{"SET", "chain:after-missing-delete", "fine"}, after.get(0));
+        }
+    }
+
+@Test
+    void aDeleteIsCountedInTheBytesThatWereSentAndInTheOffset() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:counted-delete");
+
+            feed(frame("SET", "chain:counted-delete", "value"), frame("DEL", "chain:counted-delete"));
+
+            assertNull(store.getValue("chain:counted-delete"), "the delete was not applied");
+            // both hops count the frame it actually sent, so a downstream replica's ACK
+            // matches this hop's number and WAIT counts the delete like any other write
+            long expected = frame("SET", "chain:counted-delete", "value").length
+                    + frame("DEL", "chain:counted-delete").length;
+            assertEquals(expected, redisConfig.getMasterReplOffset().longValue(),
+                    "the offset does not match the bytes this replica counted");
+            assertEquals(expected, connectionPool.bytesSentToSlaves.get(),
+                    "the bytes sent onwards do not match the frames that were propagated");
+            assertEquals(2, downstream.readFramesUntilAck().size());
+        }
+    }
+
+    @Test
+    void aReplicaKeepsNoFileOfItsOwnForAReplicatedDelete() throws Exception {
+        store.map.remove("chain:no-local-file");
+        // configured to append anyway: a replica holds no dataset of its own, so it must
+        // neither start a file nor write the writes it applies from upstream
+        assertEquals(0, appendOnlyPersistence.start(),
+                "a replica reported writing commands from a file");
+        assertFalse(appendOnlyPersistence.isEnabled(), "a replica opened an append-only file");
+
+        feed(frame("SET", "chain:no-local-file", "value"), frame("DEL", "chain:no-local-file"));
+
+        assertNull(store.getValue("chain:no-local-file"));
+        assertFalse(appendOnlyPersistence.isEnabled(),
+                "applying an upstream write re-opened the append-only file");
+        assertFalse(Files.exists(replicaAppendOnlyFile),
+                "a replica wrote a file of its own: " + replicaAppendOnlyFile);
+    }
+
     private void register(RespSocket downstream) throws Exception {
         downstream.send(frame("REPLCONF", "listening-port", "" + replicaPort));
         assertEquals("+OK", downstream.readReply());
@@ -353,7 +475,10 @@ class ChainedReplicationTest {
     private static byte[] frame(String... parts) {
         StringBuilder sb = new StringBuilder("*").append(parts.length).append("\r\n");
         for (String part : parts) {
-            sb.append("$").append(part.length()).append("\r\n").append(part).append("\r\n");
+            // RESP counts bytes, not characters, so a key that is not ASCII has to declare
+            // the length it will actually travel as
+            byte[] payload = part.getBytes(StandardCharsets.UTF_8);
+            sb.append("$").append(payload.length).append("\r\n").append(part).append("\r\n");
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }

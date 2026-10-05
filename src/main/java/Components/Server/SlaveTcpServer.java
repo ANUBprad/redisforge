@@ -2,6 +2,7 @@ package Components.Server;
 
 import Components.Infra.ConnectionPool;
 import Components.Infra.Slave;
+import Components.Repository.Store;
 import Components.Service.CommandHandler;
 import Components.Service.RespSerializer;
 import Components.Infra.Client;
@@ -17,6 +18,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.concurrent.CompletableFuture;
@@ -34,6 +36,8 @@ public class SlaveTcpServer {
     private RedisConfig redisConfig;
     @Autowired
     private ConnectionPool connectionPool;
+    @Autowired
+    private Store store;
     public void startServer(){
         ServerSocket serverSocket = null;
         Socket clientSocket = null;
@@ -129,9 +133,11 @@ public class SlaveTcpServer {
                 if(!isReplicationControlCommand(command[0])){
                     // the offset follows the write stream only, because that is what the
                     // sending side counted; a control frame is not part of it, so an ACK
-                    // from here compares equal against the master's own count
+                    // from here compares equal against the master's own count. It counts
+                    // the bytes the command travels as, in the same encoding, so the two
+                    // sides of a hop can never disagree about how far the other has got
                     redisConfig.setMasterReplOffset(redisConfig.getMasterReplOffset()
-                            + respSerializer.respArray(command).getBytes().length);
+                            + replicatedBytes(command).length);
                 }
             }
         }
@@ -196,19 +202,14 @@ public class SlaveTcpServer {
         switch (cmd){
             case "SET":
                 commandHandler.set(command);
-                String commandRespString = respSerializer.respArray(command);
-                byte[] toCount = commandRespString.getBytes();
-                connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
-                // straight down the same thread, so a replica sees the writes in the order
-                // it received them from upstream
-                propagate(command);
+                countAndPropagate(command);
                 break;
             case "INCR":
                 commandHandler.incr(command);
-                String incrRespString = respSerializer.respArray(command);
-                byte[] incrToCount = incrRespString.getBytes();
-                connectionPool.bytesSentToSlaves.addAndGet(incrToCount.length);
-                propagate(command);
+                countAndPropagate(command);
+                break;
+            case "DEL":
+                applyDeleteFromMaster(command);
                 break;
             case "REPLCONF":
                 res = commandHandler.replconf(command, master);
@@ -217,17 +218,56 @@ public class SlaveTcpServer {
         return res;
     }
 
+    /**
+     * Applies a delete the master made, and only then passes it on.
+     *
+     * <p>A replica that kept the key would go on answering with a value its master has
+     * already removed, and would pass that key down to its own replicas as well. The
+     * delete is idempotent, so a delete of a key this replica never had leaves it in step
+     * with a master that refused the same command.</p>
+     *
+     * <p>{@link Store#delete} takes the key's own lock for the whole removal, which is the
+     * same indivisible delete the master made: a client reading this replica cannot see
+     * the key half way through being gone.</p>
+     */
+    private void applyDeleteFromMaster(String[] command) {
+        if (command.length < 2) {
+            // a frame the master should not have sent. Ignored rather than allowed to
+            // throw, because this runs on the stream every other write arrives on, and one
+            // bad frame must not take the rest of the replication down with it
+            logger.log(Level.WARNING, "ignored a DEL with no key: " + String.join(" ", command));
+            return;
+        }
+        store.delete(command[1]);
+        countAndPropagate(command);
+    }
+
+    /**
+     * Counts the bytes this replica sent onwards and passes the write to the next hop, so
+     * a chained replica sees every write exactly once and WAIT counts what actually went
+     * over the wire.
+     */
+    private void countAndPropagate(String[] command) {
+        connectionPool.bytesSentToSlaves.addAndGet(replicatedBytes(command).length);
+        propagate(command);
+    }
+
+    /** The bytes a replicated command travels as, which is what the offset has to count. */
+    private byte[] replicatedBytes(String[] command) {
+        return respSerializer.respArray(command).getBytes(StandardCharsets.UTF_8);
+    }
+
     private void propagate(String[] command) {
-        String commandRespString = respSerializer.respArray(command);
         // a copy, because a replica that cannot be written to is dropped on the way past
+        byte[] propagated = replicatedBytes(command);
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
             System.out.println("========================= sending command down to slave ==============================");
-            System.out.println("command: "+commandRespString);
+            System.out.println("command: "+new String(propagated, StandardCharsets.UTF_8));
             System.out.println(slave.connection.id);
             InetAddress remoteAddress = slave.connection.socket.getInetAddress();
             System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
             try {
-                slave.send(commandRespString.getBytes());
+                slave.send(propagated);
             } catch (IOException e) {
                 // propagation runs on the upstream loop's thread, so a downstream replica
                 // that stops reading must not be allowed to break that loop

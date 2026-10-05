@@ -79,6 +79,21 @@ class ReplicationFramingTest {
     }
 
     @Test
+    void aDeleteDeliveredOneByteAtATimeIsAppliedWhole() throws Exception {
+        // a delete is framed like any other command, so it has to survive being cut at
+        // every position exactly as a SET does
+        byte[] command = frame("DEL", "repl:drip-delete");
+
+        for (int split = 1; split < command.length; split++) {
+            store.set("repl:drip-delete", "still here");
+            feed(List.of(Arrays.copyOfRange(command, 0, split), Arrays.copyOfRange(command, split, command.length)));
+
+            assertNull(value("repl:drip-delete"),
+                    "the delete was not applied when the read ended after " + split + " bytes");
+        }
+    }
+
+    @Test
     void commandDeliveredOneByteAtATimeIsAppliedWhole() throws Exception {
         byte[] command = frame("SET", "repl:drip", "one byte at a time");
         List<byte[]> oneBytePerRead = new ArrayList<>();

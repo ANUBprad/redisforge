@@ -197,6 +197,88 @@ class ConcurrencyTest {
     }
 
     @Test
+    void aDeleteQueuedInATransactionIsAppliedAndPropagatedToEveryReplica() throws Exception {
+        List<Replica> replicas = List.of(
+                Replica.attach(masterPort, 40_021, respSerializer),
+                Replica.attach(masterPort, 40_022, respSerializer));
+        try {
+            try (RespSocket client = new RespSocket(masterPort, respSerializer)) {
+                client.send(frame("SET", "tx:del-before", "v"));
+                assertEquals("+OK\r\n", client.readReply());
+
+                client.send(frame("MULTI"));
+                assertEquals("+OK\r\n", client.readReply());
+                client.send(frame("SET", "tx:del", "value"));
+                assertEquals("+QUEUED\r\n", client.readReply());
+                client.send(frame("DEL", "tx:del"));
+                assertEquals("+QUEUED\r\n", client.readReply());
+                client.send(frame("EXEC"));
+                assertEquals("*2\r\n+OK\r\n+OK\r\n", client.readReply(),
+                        "the transaction did not answer one reply per queued command");
+
+                client.send(frame("GET", "tx:del"));
+                assertEquals("$-1\r\n", client.readReply(),
+                        "the master still holds the key its own transaction deleted");
+            }
+
+            for (Replica replica : replicas) {
+                replica.awaitFrames(3);
+                List<String[]> frames = replica.frames();
+                assertEquals(3, frames.size(),
+                        replica.name + " did not receive the transaction's three mutations");
+                assertArrayEqualsAsList(new String[]{"SET", "tx:del-before", "v"}, frames.get(0));
+                assertArrayEqualsAsList(new String[]{"SET", "tx:del", "value"}, frames.get(1));
+                assertArrayEqualsAsList(new String[]{"DEL", "tx:del"}, frames.get(2));
+            }
+        } finally {
+            closeAll(replicas);
+        }
+    }
+
+    @Test
+    void aMixedTransactionOfSetsAndADeleteIsPropagatedAsItWasApplied() throws Exception {
+        List<Replica> replicas = List.of(Replica.attach(masterPort, 40_023, respSerializer));
+        try {
+            try (RespSocket client = new RespSocket(masterPort, respSerializer)) {
+                client.send(frame("MULTI"));
+                assertEquals("+OK\r\n", client.readReply());
+                client.send(frame("SET", "mixed:a", "1"));
+                assertEquals("+QUEUED\r\n", client.readReply());
+                client.send(frame("SET", "mixed:b", "2"));
+                assertEquals("+QUEUED\r\n", client.readReply());
+                client.send(frame("DEL", "mixed:a"));
+                assertEquals("+QUEUED\r\n", client.readReply());
+                client.send(frame("EXEC"));
+                assertEquals("*3\r\n+OK\r\n+OK\r\n+OK\r\n", client.readReply(),
+                        "the mixed transaction did not answer one reply per queued command");
+
+                client.send(frame("GET", "mixed:a"));
+                assertEquals("$-1\r\n", client.readReply(),
+                        "the mixed transaction's delete did not take effect on the master");
+                client.send(frame("GET", "mixed:b"));
+                assertEquals("$1\r\n2\r\n", client.readReply(),
+                        "the mixed transaction lost the key it did not delete");
+            }
+
+            Replica replica = replicas.get(0);
+            replica.awaitFrames(3);
+            List<String[]> frames = replica.frames();
+            assertEquals(3, frames.size(),
+                    replica.name + " did not receive every mutation of the transaction");
+            assertArrayEqualsAsList(new String[]{"SET", "mixed:a", "1"}, frames.get(0));
+            assertArrayEqualsAsList(new String[]{"SET", "mixed:b", "2"}, frames.get(1));
+            assertArrayEqualsAsList(new String[]{"DEL", "mixed:a"}, frames.get(2));
+        } finally {
+            closeAll(replicas);
+        }
+    }
+
+    private static void assertArrayEqualsAsList(String[] expected, String[] actual) {
+        assertEquals(List.of(expected), Arrays.asList(actual),
+                "expected " + String.join(" ", expected) + " but got " + String.join(" ", actual));
+    }
+
+    @Test
     void transactionsAndSingleCommandsShareOneCounterWithoutLosingAnIncrement() throws Exception {
         int transactions = 5;
         int perTransaction = 10;

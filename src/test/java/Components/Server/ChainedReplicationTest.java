@@ -88,8 +88,8 @@ class ChainedReplicationTest {
     @BeforeEach
     void resetReplicaState() throws Exception {
         await(() -> connectionPool.getSlaves().isEmpty(), "a replica from an earlier test is still registered");
-        connectionPool.slavesThatAreCaughtUp = 0;
-        connectionPool.bytesSentToSlaves = 0;
+        connectionPool.slavesThatAreCaughtUp.set(0);
+        connectionPool.bytesSentToSlaves.set(0);
         redisConfig.setMasterReplOffset(0L);
     }
 
@@ -123,12 +123,12 @@ class ChainedReplicationTest {
     void replconfAckMatchingTheStreamCountsTheReplicaAsCaughtUp() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);
-            connectionPool.slavesThatAreCaughtUp = 0;
-            connectionPool.bytesSentToSlaves = 42;
+            connectionPool.slavesThatAreCaughtUp.set(0);
+            connectionPool.bytesSentToSlaves.set(42);
 
             downstream.send(frame("REPLCONF", "ACK", "42"));
 
-            await(() -> connectionPool.slavesThatAreCaughtUp == 1,
+            await(() -> connectionPool.slavesThatAreCaughtUp.get() == 1,
                     "an ACK that matches the bytes sent did not count the replica as caught up");
             assertEquals("", downstream.expectNothing(),
                     "an ACK is consumed, it is not answered");
@@ -139,13 +139,13 @@ class ChainedReplicationTest {
     void replconfAckThatDoesNotMatchTheStreamCountsNothing() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);
-            connectionPool.slavesThatAreCaughtUp = 0;
-            connectionPool.bytesSentToSlaves = 42;
+            connectionPool.slavesThatAreCaughtUp.set(0);
+            connectionPool.bytesSentToSlaves.set(42);
 
             downstream.send(frame("REPLCONF", "ACK", "7"));
 
             assertEquals("", downstream.expectNothing());
-            assertEquals(0, connectionPool.slavesThatAreCaughtUp,
+            assertEquals(0, connectionPool.slavesThatAreCaughtUp.get(),
                     "an ACK below what was sent counted the replica as caught up");
         }
     }
@@ -275,13 +275,32 @@ class ChainedReplicationTest {
 
                 assertEquals(":1", client.readReply(), "the downstream replica was not counted by WAIT");
             }
-            assertEquals(0, connectionPool.slavesThatAreCaughtUp, "the caught up count was not reset");
+            assertEquals(0, connectionPool.slavesThatAreCaughtUp.get(), "the caught up count was not reset");
 
             // a downstream replica that does not answer counts for nothing
             feed(frame("SET", "chain:wait", "unanswered"));
             try (RespSocket client = new RespSocket(replicaPort)) {
                 client.send(frame("WAIT", "1", "150"));
                 assertEquals(":0", client.readReply());
+            }
+        }
+    }
+
+    @Test
+    void incrementsReceivedFromTheMasterAreAppliedAndPropagated() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+
+            feed(frame("INCR", "chain:counter"), frame("INCR", "chain:counter"), frame("INCR", "chain:counter"));
+
+            assertEquals("3", store.getValue("chain:counter").val,
+                    "the streamed increments were not all applied");
+            // the downstream replica is sent the increments themselves, not the values it
+            // would compute, so it stays in step with this replica
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(3, received.size());
+            for (int i = 0; i < 3; i++) {
+                assertArrayEquals(new String[]{"INCR", "chain:counter"}, received.get(i));
             }
         }
     }

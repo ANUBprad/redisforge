@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -141,7 +142,7 @@ public class MasterTcpServer {
                     String[] commandToPropagate = commands.poll();
                     String commandRespString = respSerializer.respArray(commandToPropagate);
                     byte[] toCount = commandRespString.getBytes();
-                    connectionPool.bytesSentToSlaves += toCount.length;
+                    connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
                     propagate(commandToPropagate);
                 }
 
@@ -187,9 +188,24 @@ public class MasterTcpServer {
                 client.beginTransaction();
                 res = "+OK\r\n";
                 break;
-            case "INCR":
-                res = commandHandler.incr(command);
+            case "INCR": {
+                // applied and propagated inside one hold of the key's lock, so replicas
+                // see the increments of a key in the order this master applied them
+                ReentrantLock keyLock = store.lockFor(command[1]);
+                keyLock.lock();
+                try {
+                    res = commandHandler.incr(command);
+                    // an increment that was refused is not a mutation, so it is not replicated
+                    if (!res.startsWith("-")) {
+                        String incrToPropagate = respSerializer.respArray(command);
+                        connectionPool.bytesSentToSlaves.addAndGet(incrToPropagate.getBytes().length);
+                        propagate(command);
+                    }
+                } finally {
+                    keyLock.unlock();
+                }
                 break;
+            }
             case "ECHO":
                 res = commandHandler.echo(command);
                 break;
@@ -197,7 +213,7 @@ public class MasterTcpServer {
                 res = commandHandler.set(command);
                 String commandRespString = respSerializer.respArray(command);
                 byte[] toCount = commandRespString.getBytes();
-                connectionPool.bytesSentToSlaves += toCount.length;
+                connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
                 // on this thread, so replicas receive writes in the order they arrived
                 propagate(command);
                 break;
@@ -211,13 +227,13 @@ public class MasterTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(connectionPool.bytesSentToSlaves == 0){
-                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp);
+                if(connectionPool.bytesSentToSlaves.get() == 0){
+                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
                     break;
                 }
                 Instant start = Instant.now();
                 res = commandHandler.wait(command, start);
-                connectionPool.slavesThatAreCaughtUp = 0;
+                connectionPool.slavesThatAreCaughtUp.set(0);
                 break;
             case "PSYNC":
                 ResponseDto resDto = commandHandler.psync(command);

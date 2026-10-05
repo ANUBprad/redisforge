@@ -8,6 +8,7 @@ import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
@@ -17,11 +18,21 @@ import java.util.logging.Logger;
 public class Store {
     private static final Logger logger = Logger.getLogger(Store.class.getName());
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+    // one lock per key, so a compound operation on a key cannot interleave with another
+    // one on the same key while keys keep running independently of each other. A
+    // ReentrantLock rather than a monitor, because a transaction has to hold the locks of
+    // several keys at once and release them one by one at the end.
+    private final ConcurrentHashMap<String, ReentrantLock> keyLocks = new ConcurrentHashMap<>();
     public ConcurrentHashMap<String, Value> map;
     @Autowired
     public RespSerializer respSerializer;
     public Store(){
         map = new ConcurrentHashMap<>();
+    }
+
+    /** The lock that guards a single key. Held across a read followed by a write. */
+    public ReentrantLock lockFor(String key) {
+        return keyLocks.computeIfAbsent(key, k -> new ReentrantLock());
     }
 
     public Set<String> getKeys(){
@@ -34,32 +45,77 @@ public class Store {
     }
 
     public String set(String key, String val){
-        rwLock.writeLock().lock();
-        try{
-            Value value = new Value(val, LocalDateTime.now(), LocalDateTime.MAX);
-            map.put(key, value);
-            return "+OK\r\n";
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, e.getMessage());
-            return "$-1\r\n";
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try{
+                Value value = new Value(val, LocalDateTime.now(), LocalDateTime.MAX);
+                map.put(key, value);
+                return "+OK\r\n";
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, e.getMessage());
+                return "$-1\r\n";
+            }finally{
+                rwLock.writeLock().unlock();
+            }
         }finally{
-            rwLock.writeLock().unlock();
+            keyLock.unlock();
         }
     }
 
     public String set(String key, String val, int expiryMilliseconds){
-        rwLock.writeLock().lock();
-        try{
-            LocalDateTime now = LocalDateTime.now();
-            LocalDateTime exp = now.plus(expiryMilliseconds, ChronoUnit.MILLIS);
-            Value value = new Value(val, now, exp);
-            map.put(key, value);
-            return "+OK\r\n";
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, e.getMessage());
-            return "$-1\r\n";
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try{
+                LocalDateTime now = LocalDateTime.now();
+                LocalDateTime exp = now.plus(expiryMilliseconds, ChronoUnit.MILLIS);
+                Value value = new Value(val, now, exp);
+                map.put(key, value);
+                return "+OK\r\n";
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, e.getMessage());
+                return "$-1\r\n";
+            }finally{
+                rwLock.writeLock().unlock();
+            }
         }finally{
-            rwLock.writeLock().unlock();
+            keyLock.unlock();
+        }
+    }
+
+    /**
+     * Reads, parses, adds one and stores again as one step. A concurrent map would still
+     * lose increments here: two callers can both read the same value and both store the
+     * same successor. The key's lock is what makes the whole thing indivisible.
+     */
+    public String increment(String key) {
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            Value current = map.get(key);
+            if (current != null && current.expiry.isBefore(now)) {
+                map.remove(key, current);
+                current = null;
+            }
+            if (current == null) {
+                map.put(key, new Value("1", now, LocalDateTime.MAX));
+                return respSerializer.respInteger(1);
+            }
+            int incremented;
+            try {
+                incremented = Integer.parseInt(current.val) + 1;
+            } catch (NumberFormatException notAnInteger) {
+                return "-ERR value is not an integer or out of range\r\n";
+            }
+            // a counter keeps the expiry the key already carried
+            map.put(key, new Value(String.valueOf(incremented), current.created, current.expiry));
+            return respSerializer.respInteger(incremented);
+        }finally{
+            keyLock.unlock();
         }
     }
 
@@ -69,8 +125,13 @@ public class Store {
             LocalDateTime now = LocalDateTime.now();
             Value value = map.get(key);
 
-            if(value!=null && value.expiry.isBefore(now)){
-                map.remove(key);
+            if(value == null){
+                return "$-1\r\n";
+            }
+            if(value.expiry.isBefore(now)){
+                // remove this exact entry: a set that lands between the read and here must
+                // not have its fresh value dropped by the cleanup
+                map.remove(key, value);
                 return "$-1\r\n";
             }
             return respSerializer.serializeBulkString(value.val);
@@ -88,8 +149,8 @@ public class Store {
             LocalDateTime now = LocalDateTime.now();
             Value value = map.getOrDefault(key, null);
 
-            if(value!=null && value.expiry.isBefore(now)){
-                map.remove(key);
+            if(value != null && value.expiry.isBefore(now)){
+                map.remove(key, value);
                 return null;
             }
             return value;
@@ -105,9 +166,18 @@ public class Store {
             Client client,
             BiFunction<String[], Map<String, Value>, String> transactionCacheApplier
     ){
-        rwLock.writeLock().lock();
         Map<String, Value> localCache = new HashMap<>();
         List<String> responses = new ArrayList<>();
+        // Every key this transaction touches is held for the whole apply and commit. A
+        // single INCR or SET on the same key would otherwise be able to read the value the
+        // transaction started from, and then write its result after the transaction had
+        // already committed its own.
+        //
+        // The key locks come before the write lock, which is the order set and increment
+        // take as well. Taking them the other way round would let a transaction and a
+        // single command on a shared key wait for each other.
+        List<ReentrantLock> held = lockKeysInOrder(client.commandQueue);
+        rwLock.writeLock().lock();
         try{
             while(!client.commandQueue.isEmpty()){
                 String[] command = client.commandQueue.poll();
@@ -130,6 +200,31 @@ public class Store {
             client.transactionResponse.addAll(responses);
         }finally {
             rwLock.writeLock().unlock();
+            for(int i = held.size() - 1; i >= 0; i--){
+                held.get(i).unlock();
+            }
         }
+    }
+
+    /**
+     * Locks every key the queued commands name, in a fixed order, and returns the locks so
+     * the caller can release them again. The fixed order is what keeps two transactions
+     * that touch the same keys in opposite orders from waiting on each other forever.
+     */
+    private List<ReentrantLock> lockKeysInOrder(Queue<String[]> commandQueue) {
+        Set<String> keys = new TreeSet<>();
+        for (String[] command : new ArrayList<>(commandQueue)) {
+            if (command.length > 1) {
+                keys.add(command[1]);
+            }
+        }
+
+        List<ReentrantLock> held = new ArrayList<>(keys.size());
+        for (String key : keys) {
+            ReentrantLock keyLock = lockFor(key);
+            keyLock.lock();
+            held.add(keyLock);
+        }
+        return held;
     }
 }

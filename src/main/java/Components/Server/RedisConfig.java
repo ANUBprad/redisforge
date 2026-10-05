@@ -13,7 +13,9 @@ public class RedisConfig {
     private String masterHost;
     private int masterPort;
     private String masterReplId = null;
-    private Long masterReplOffset = null;
+    // written by the upstream replication thread and read by whatever thread answers a
+    // GETACK or reports on INFO
+    private volatile Long masterReplOffset = null;
 
     public String getMasterReplId() {
         if(masterReplId == null){

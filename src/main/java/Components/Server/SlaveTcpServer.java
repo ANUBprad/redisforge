@@ -198,9 +198,16 @@ public class SlaveTcpServer {
                 commandHandler.set(command);
                 String commandRespString = respSerializer.respArray(command);
                 byte[] toCount = commandRespString.getBytes();
-                connectionPool.bytesSentToSlaves += toCount.length;
+                connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
                 // straight down the same thread, so a replica sees the writes in the order
                 // it received them from upstream
+                propagate(command);
+                break;
+            case "INCR":
+                commandHandler.incr(command);
+                String incrRespString = respSerializer.respArray(command);
+                byte[] incrToCount = incrRespString.getBytes();
+                connectionPool.bytesSentToSlaves.addAndGet(incrToCount.length);
                 propagate(command);
                 break;
             case "REPLCONF":
@@ -286,14 +293,14 @@ public class SlaveTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(connectionPool.bytesSentToSlaves == 0){
-                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp);
+                if(connectionPool.bytesSentToSlaves.get() == 0){
+                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
                     break;
                 }
 
                 Instant start = Instant.now();
                 res = commandHandler.wait(command, start);
-                connectionPool.slavesThatAreCaughtUp = 0;
+                connectionPool.slavesThatAreCaughtUp.set(0);
                 break;
         }
         client.send(res, data);

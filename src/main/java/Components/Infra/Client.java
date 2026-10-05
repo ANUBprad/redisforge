@@ -48,14 +48,17 @@ public class Client {
         this.id = id;
     }
 
-    public void send(String res, byte[] data) throws IOException {
+    // A replica connection is written to by whichever client thread is propagating at that
+    // moment, so the frames have to be serialized per connection: two threads sharing an
+    // output stream can otherwise interleave halves of a frame.
+    public synchronized void send(String res, byte[] data) throws IOException {
         if(res !=null && !res.equals(""))
             outputStream.write(res.getBytes());
         if(data!=null)
             outputStream.write(data);
     }
 
-    public void send(ResponseDto res) throws IOException {
+    public synchronized void send(ResponseDto res) throws IOException {
         if(res.response !=null && !res.response.isEmpty())
             outputStream.write(res.response.getBytes());
         if(res.data!=null)
@@ -79,12 +82,12 @@ public class Client {
         }
     }
 
-    public void send(byte[] data) throws IOException {
+    public synchronized void send(byte[] data) throws IOException {
         if(data!=null)
             outputStream.write(data);
     }
 
-    public void send(String data) throws IOException {
+    public synchronized void send(String data) throws IOException {
         if(data!=null && !data.isEmpty())
             outputStream.write(data.getBytes());
     }

@@ -140,7 +140,7 @@ public class CommandHandler {
             String fullResyncHeader = "$"+ length +"\r\n";
             byte[] header = fullResyncHeader.getBytes();
 
-            connectionPool.slavesThatAreCaughtUp++;
+            connectionPool.slavesThatAreCaughtUp.incrementAndGet();
 
             return new ResponseDto(res, concatenate(header, rdbFileData));
         }else{
@@ -173,7 +173,7 @@ public class CommandHandler {
                 break;
             if(Duration.between(start, Instant.now()).toMillis() >= time)
                 break;
-            res= connectionPool.slavesThatAreCaughtUp;
+            res= connectionPool.slavesThatAreCaughtUp.get();
         }
         // bytesSentToSlaves counts replicated writes only. Folding the GETACK into it would
         // push it past the offset a replica reports back, and the next ACK would never match
@@ -182,25 +182,9 @@ public class CommandHandler {
         return respSerializer.respInteger(res);
     }
     public String incr(String[] command) {
-        String key =command[1];
-        String res = "";
-        try{
-            Value value = store.getValue(key);
-            if(value == null){
-                store.set(key, "0");
-                value = store.getValue(key);
-            }
-
-            int val = Integer.parseInt(value.val);
-            val++;
-            value.val = val+"";
-
-            res = respSerializer.respInteger(val);
-
-        } catch (Exception e) {
-            res = "-ERR value is not an integer or out of range\r\n";
-        }
-        return res;
+        // the store owns the read, parse, increment and write, so two clients cannot read
+        // the same value and both store the same successor
+        return store.increment(command[1]);
     }
     public BiFunction<String[], Map<String, Value>, String> getTransactionCommandCacheApplier(){
         final Store localStore = this.store;

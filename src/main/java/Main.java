@@ -51,6 +51,9 @@ public class Main {
 
         AppendOnlyPersistence appendOnly = context.getBean(AppendOnlyPersistence.class);
         if(redisConfig.getRole().equals("slave")){
+            // the accept loop and the follower's retries are both ended on the way out,
+            // so a signal closes the replica's sockets instead of leaving them open
+            Runtime.getRuntime().addShutdownHook(new Thread(slave::stop, "replica-shutdown"));
             slave.startServer();
         }else{
             // recovery runs before the listening socket exists, so the first client to

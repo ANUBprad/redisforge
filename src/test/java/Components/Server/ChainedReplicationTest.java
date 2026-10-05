@@ -122,7 +122,7 @@ class ChainedReplicationTest {
     @Test
     void replconfCapaPsync2IsAcceptedAndRecorded() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
-            register(downstream);
+            registerOnly(downstream);
 
             downstream.send(frame("REPLCONF", "capa", "psync2"));
 
@@ -447,7 +447,27 @@ class ChainedReplicationTest {
                 "a replica wrote a file of its own: " + replicaAppendOnlyFile);
     }
 
+    /**
+     * Registers a downstream replica and starts its command stream, which is what a real
+     * replica does before it can be sent anything: the master holds writes back until the
+     * PSYNC has been answered, so a replica that stopped at the listening port would
+     * receive nothing.
+     */
     private void register(RespSocket downstream) throws Exception {
+        registerOnly(downstream);
+        downstream.send(frame("REPLCONF", "capa", "psync2"));
+        assertEquals("+OK", downstream.readReply());
+        downstream.send(frame("PSYNC", "?", "-1"));
+        String status = downstream.readLine();
+        assertTrue(status.startsWith("+FULLRESYNC "), "no FULLRESYNC for the downstream replica: " + status);
+        // the RDB is counted off, so nothing that follows it is read as part of the payload
+        int declaredLength = Integer.parseInt(downstream.readLine().substring(1));
+        downstream.readExactly(declaredLength);
+        await(() -> !connectionPool.getSlaves().isEmpty(), "the downstream replica never registered");
+    }
+
+    /** Stops after the listening port, which is where the connection is registered. */
+    private void registerOnly(RespSocket downstream) throws Exception {
         downstream.send(frame("REPLCONF", "listening-port", "" + replicaPort));
         assertEquals("+OK", downstream.readReply());
         await(() -> !connectionPool.getSlaves().isEmpty(), "the downstream replica never registered");

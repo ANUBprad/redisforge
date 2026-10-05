@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -28,6 +29,13 @@ import java.util.logging.Logger;
 @Component
 public class SlaveTcpServer {
     private static final Logger logger = Logger.getLogger(SlaveTcpServer.class.getName());
+
+    /** how long to wait before the first retry, and how far that wait may grow */
+    private static final long FIRST_RETRY_DELAY_MS = 250;
+    private static final long MAX_RETRY_DELAY_MS = 2_000;
+    /** how long to wait for the master's socket to answer, so a dead host cannot hang us */
+    private static final int CONNECT_TIMEOUT_MS = 2_000;
+
     @Autowired
     private RespSerializer respSerializer;
     @Autowired
@@ -38,8 +46,15 @@ public class SlaveTcpServer {
     private ConnectionPool connectionPool;
     @Autowired
     private Store store;
+
+    private volatile boolean running = true;
+    /** the socket currently following the master, so shutting down can close it */
+    private volatile Socket masterConnection;
+    /** the retry waits on this, so stopping the server does not have to wait them out */
+    private final Object retryLock = new Object();
+    private volatile ServerSocket serverSocket;
+
     public void startServer(){
-        ServerSocket serverSocket = null;
         Socket clientSocket = null;
         int port = redisConfig.getPort();
 
@@ -47,11 +62,17 @@ public class SlaveTcpServer {
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);
 
-            CompletableFuture<Void> slaveConnectionFuture = CompletableFuture.runAsync(this::initiateSlavery);
-            slaveConnectionFuture.thenRun(()->System.out.println("Replication completed"));
+            // one thread follows the master for as long as this server runs. It hands the
+            // stream over when the master hangs up and looks for it again when there is
+            // none, so a replica that starts too early, or loses its master, recovers by
+            // itself. Exactly one thread and one socket at a time, which is what keeps a
+            // reconnect from duplicating the stream or applying a write twice.
+            Thread follower = new Thread(this::followMasterUntilStopped, "replication-follower");
+            follower.setDaemon(true);
+            follower.start();
 
             int id = 0;
-            while (true) {
+            while (running) {
                 clientSocket = serverSocket.accept();
                 id++;
                 Socket finalClientSocket = clientSocket;
@@ -70,20 +91,73 @@ public class SlaveTcpServer {
             }
 
         } catch (IOException e) {
-            logger.log(Level.SEVERE, e.getMessage());
-        } finally {
-            try {
-                if (clientSocket != null) {
-                    clientSocket.close();
-                }
-            } catch (IOException e) {
+            if (running) {
                 logger.log(Level.SEVERE, e.getMessage());
             }
+        } finally {
+            closeQuietly(clientSocket);
         }
     }
 
-    private void initiateSlavery() {
-        try(Socket master = new Socket(redisConfig.getMasterHost(), redisConfig.getMasterPort())){
+    /**
+     * Stops the server: no further retries, and the sockets it is holding are closed so
+     * neither the accept loop nor a read that is waiting on the master can hold the
+     * process open.
+     */
+    public void stop() {
+        running = false;
+        synchronized (retryLock) {
+            retryLock.notifyAll();
+        }
+        closeQuietly(masterConnection);
+        closeQuietly(serverSocket);
+    }
+
+    /**
+     * Keeps trying to follow the master until the server is stopped.
+     *
+     * <p>A master that is not there yet is waited for rather than given up on, and a master
+     * that goes away is looked for again. The wait grows each time an attempt fails, so a
+     * master that stays down is not asked for in a tight loop, and it starts over as soon
+     * as an attempt gets far enough to be talking to a real master.</p>
+     */
+    private void followMasterUntilStopped() {
+        long delay = FIRST_RETRY_DELAY_MS;
+        while (running) {
+            try {
+                if (followMasterOnce()) {
+                    // the handshake worked, so the next wait starts at the floor again
+                    delay = FIRST_RETRY_DELAY_MS;
+                }
+            } catch (IOException e) {
+                if (running) {
+                    logger.log(Level.WARNING, "the master is not available ("
+                            + e.getMessage() + "), looking for it again in " + delay + "ms");
+                }
+            }
+            if (!running || !waitBeforeRetry(delay)) {
+                return;
+            }
+            delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
+        }
+    }
+
+    /**
+     * One attempt at attaching to the master: connect, handshake, then stay on the stream
+     * until the master hangs up.
+     *
+     * @return true once the handshake completed, which is the point at which this replica is
+     *         really following a master
+     * @throws IOException if the master could not be reached or the handshake did not
+     *         finish, in which case the next attempt starts from a new socket
+     */
+    private boolean followMasterOnce() throws IOException {
+        Socket master = new Socket();
+        try {
+            master.connect(new InetSocketAddress(redisConfig.getMasterHost(), redisConfig.getMasterPort()),
+                    CONNECT_TIMEOUT_MS);
+            masterConnection = master;
+
             InputStream inputStream = master.getInputStream();
             OutputStream outputStream = master.getOutputStream();
 
@@ -109,8 +183,53 @@ public class SlaveTcpServer {
             readFullResync(inputStream);
 
             streamFromMaster(new Client(master, inputStream, outputStream, -1));
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, e.getMessage());
+            // the master hung up, which is not a failure: the loop looks for it again
+            return true;
+        } finally {
+            masterConnection = null;
+            closeQuietly(master);
+        }
+    }
+
+    /**
+     * Waits before the next attempt, unless the server is stopped first.
+     *
+     * @return true when it is time to try again
+     */
+    private boolean waitBeforeRetry(long delay) {
+        synchronized (retryLock) {
+            if (!running) {
+                return false;
+            }
+            try {
+                retryLock.wait(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            return running;
+        }
+    }
+
+    private void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (IOException e) {
+            logger.log(Level.FINE, e.getMessage());
+        }
+    }
+
+    private void closeQuietly(ServerSocket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (IOException e) {
+            logger.log(Level.FINE, e.getMessage());
         }
     }
 
@@ -261,6 +380,12 @@ public class SlaveTcpServer {
         // a copy, because a replica that cannot be written to is dropped on the way past
         byte[] propagated = replicatedBytes(command);
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            if(!slave.isReady()){
+                // registered by a downstream replica, but still handshaking: a write now
+                // would be read by one that is waiting for its FULLRESYNC, so it waits too
+                logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
+                continue;
+            }
             System.out.println("========================= sending command down to slave ==============================");
             System.out.println("command: "+new String(propagated, StandardCharsets.UTF_8));
             System.out.println(slave.connection.id);
@@ -323,7 +448,7 @@ public class SlaveTcpServer {
                 res = commandHandler.info(command);
                 break;
             case "PSYNC":
-                ResponseDto resDto = commandHandler.psync(command);
+                ResponseDto resDto = commandHandler.psync(command, client);
                 res = resDto.response;
                 data = resDto.data;
                 break;

@@ -34,6 +34,16 @@ public class ConnectionPool {
         return slaves;
     }
 
+    /** The replica registered on this connection, or null when it never registered. */
+    public Slave slaveFor(Client client){
+        for(Slave slave: slaves){
+            if(slave.connection.equals(client)){
+                return slave;
+            }
+        }
+        return null;
+    }
+
     public void addClient(Client client){
         if(client!=null)
             clients.add(client);
@@ -53,13 +63,7 @@ public class ConnectionPool {
     }
 
     public boolean removeSlave(Client client){
-        Slave slaveToRemove = null;
-        for(Slave s: slaves){
-            if(s.connection.equals(client)){
-                slaveToRemove = s;
-                break;
-            }
-        }
+        Slave slaveToRemove = slaveFor(client);
         // a plain client never registered as a replica, and a concurrent set rejects a
         // null key, so there has to be something to remove before asking
         if(slaveToRemove == null){

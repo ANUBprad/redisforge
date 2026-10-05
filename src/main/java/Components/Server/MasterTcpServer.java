@@ -283,7 +283,7 @@ public class MasterTcpServer {
                 connectionPool.slavesThatAreCaughtUp.set(0);
                 break;
             case "PSYNC":
-                ResponseDto resDto = commandHandler.psync(command);
+                ResponseDto resDto = commandHandler.psync(command, client);
                 res = resDto.response;
                 data = resDto.data;
                 break;
@@ -298,6 +298,12 @@ public class MasterTcpServer {
         byte[] propagated = commandRespString.getBytes(StandardCharsets.UTF_8);
         // a copy, because a replica that cannot be written to is dropped on the way past
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            if(!slave.isReady()){
+                // registered, but still handshaking: a write now would be read by a replica
+                // that is waiting for its FULLRESYNC, so it is left until the stream starts
+                logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
+                continue;
+            }
             System.out.println("========================= sending command down to slave ==============================");
             System.out.println("command: "+commandRespString);
             System.out.println(slave.connection.id);

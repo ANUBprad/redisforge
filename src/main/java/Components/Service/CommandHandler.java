@@ -101,12 +101,11 @@ public class CommandHandler {
                 return "+OK\r\n";
 
             case "capa":
-                Slave slave = null;
-                for(Slave ss: connectionPool.getSlaves()){
-                    if(ss.connection.equals(client)){
-                        slave = ss;
-                        break;
-                    }
+                Slave slave = connectionPool.slaveFor(client);
+                // capabilities are recorded against the registered replica, and a connection
+                // that never registered has none to record them on
+                if(slave == null){
+                    return "+OK\r\n";
                 }
                 for(int i=0; i<command.length; i++){
                     if(command[i].equals("capa")){
@@ -124,7 +123,7 @@ public class CommandHandler {
         System.arraycopy(b, 0, result, a.length, b.length);
         return result;
     }
-    public ResponseDto psync(String[] command) {
+    public ResponseDto psync(String[] command, Client client) {
         String replicationIdMaster = command[1];
         String replicationOffSetMaster = command[2];
 
@@ -141,6 +140,16 @@ public class CommandHandler {
             byte[] header = fullResyncHeader.getBytes();
 
             connectionPool.slavesThatAreCaughtUp.incrementAndGet();
+
+            // the replica's command stream starts here, and only from this point can it be
+            // sent writes. It registered itself earlier, when it gave its listening port, and
+            // anything sent before this would arrive in the middle of its handshake and take
+            // the whole stream out of step. A master and a replica that is itself a master to
+            // another replica both come through here, so neither can forget it
+            Slave slave = connectionPool.slaveFor(client);
+            if(slave != null){
+                slave.markReady();
+            }
 
             return new ResponseDto(res, concatenate(header, rdbFileData));
         }else{
@@ -159,6 +168,11 @@ public class CommandHandler {
         // straight down the thread that is waiting, so a replica cannot answer this
         // GETACK before the writes that were propagated ahead of it
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+            if(!slave.isReady()){
+                // the same reason writes wait: this replica is registered but its stream has
+                // not started, and a GETACK now would land in the middle of its handshake
+                continue;
+            }
             try {
                 slave.connection.send(bytearr);
             } catch (IOException e) {

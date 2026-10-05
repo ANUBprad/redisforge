@@ -330,10 +330,23 @@ class Utf8ServerTest {
 
     // ---------- helpers ----------
 
+    /**
+     * Registers a downstream replica and starts its command stream. A real replica sends
+     * PSYNC before it can be sent anything, and the master holds writes back until it has,
+     * so stopping at the listening port would receive nothing.
+     */
     private void register(RespSocket downstream) throws Exception {
         downstream.send(frame("REPLCONF", "listening-port", "" + replicaPort));
         assertEquals("+OK\r\n", downstream.readReply());
         await(() -> !connectionPool.getSlaves().isEmpty(), "the downstream replica never registered");
+        downstream.send(frame("REPLCONF", "capa", "psync2"));
+        assertEquals("+OK\r\n", downstream.readReply());
+        downstream.send(frame("PSYNC", "?", "-1"));
+        String status = downstream.readLine();
+        assertTrue(status.startsWith("+FULLRESYNC "), "no FULLRESYNC for the downstream replica: " + status);
+        int declaredLength = Integer.parseInt(downstream.readLine().substring(1));
+        // counted off exactly, so the bytes after it are a streamed command and nothing else
+        downstream.readExactly(declaredLength);
     }
 
     /** Runs the upstream stream the way the master's socket delivers it. */
@@ -585,6 +598,15 @@ class Utf8ServerTest {
                 sb.append((char) b);
             }
             throw new EOFException("connection closed mid line");
+        }
+
+        /** Reads exactly as many bytes as were asked for, or says how few there were. */
+        private byte[] readExactly(int length) throws IOException {
+            byte[] bytes = in.readNBytes(length);
+            if (bytes.length != length) {
+                throw new EOFException("read " + bytes.length + " of " + length + " bytes");
+            }
+            return bytes;
         }
 
         @Override

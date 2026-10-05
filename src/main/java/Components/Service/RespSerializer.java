@@ -17,35 +17,17 @@ public class RespSerializer {
     /** returned by {@link #frameLength} when the bytes cannot be the start of an array */
     public static final int MALFORMED_FRAME = -2;
 
+    /** the most a single length header may claim, which is the ceiling Redis itself uses */
+    private static final int MAX_FRAME_LENGTH = 512 * 1024 * 1024;
+
     public String serializeBulkString(String s){
-        int length = s.length();
+        // the header counts bytes on the wire, not characters in the JVM: "é" is two
+        // bytes and "🌍" is four, and the reader takes the reader that many bytes before
+        // it decodes anything
+        int length = s.getBytes(StandardCharsets.UTF_8).length;
         String respHeader = "$"+length;
         String respBody = s;
         return respHeader + "\r\n" + respBody + "\r\n";
-    }
-
-    public int getParts(char []dataArr, int i, String[] subArray){
-        int j=0;
-        while(i< dataArr.length && j < subArray.length){
-            if(dataArr[i] == '$'){
-                //bulk String
-                //$<length>\r\n<data>\r\n
-                i++;
-                String partLength = "";
-                while(i < dataArr.length && Character.isDigit(dataArr[i])){
-                    partLength += dataArr[i];
-                    i++;
-                }
-                i+=2;
-                StringBuilder part = new StringBuilder();
-                for(int k=0; k<Integer.parseInt(partLength);k++){
-                    part.append(dataArr[i++]);
-                }
-                i+=2;
-                subArray[j++]=part.toString();
-            }
-        }
-        return i;
     }
 
     /**
@@ -70,6 +52,9 @@ public class RespSerializer {
             return lineEnd;
         }
         int elements = parseLength(data, from + 1, lineEnd);
+        if(elements < 0){
+            return MALFORMED_FRAME;
+        }
 
         int i = lineEnd + 2;
         for(int element = 0; element < elements; element++){
@@ -84,7 +69,11 @@ public class RespSerializer {
             if(lineEnd < 0){
                 return lineEnd;
             }
-            i = lineEnd + 2 + parseLength(data, i + 1, lineEnd);
+            int length = parseLength(data, i + 1, lineEnd);
+            if(length < 0){
+                return MALFORMED_FRAME;
+            }
+            i = lineEnd + 2 + length;
             if(i + 1 >= to){
                 return INCOMPLETE_FRAME;
             }
@@ -121,11 +110,16 @@ public class RespSerializer {
     }
 
     private int parseLength(byte[] data, int from, int to){
-        int length = 0;
+        // a header long enough to overflow an int is not a length anybody can send, and
+        // letting it wrap would hand the rest of the parser a negative offset to walk
+        long length = 0;
         for(int i = from; i < to; i++){
             length = length * 10 + (data[i] - '0');
+            if(length > MAX_FRAME_LENGTH){
+                return MALFORMED_FRAME;
+            }
         }
-        return length;
+        return (int) length;
     }
 
     public List<String[]> deseralize(byte[] command){
@@ -133,63 +127,160 @@ public class RespSerializer {
     }
 
     /**
-     * Decodes the RESP arrays held in data[from, to). Callers must pass whole frames:
-     * trailing bytes that belong to the next array, or that have not arrived yet, are
-     * the caller's to keep.
+     * Decodes every RESP array held in data[from, to).
+     *
+     * <p>Everything is walked by byte. A bulk string's header says how many <em>bytes</em>
+     * its payload takes, exactly those bytes are taken, the CRLF behind them is consumed,
+     * and only then are they decoded. Measuring the payload in characters instead loses a
+     * byte per multi byte character, which left the cursor somewhere inside the payload
+     * and could not find its way out again.</p>
+     *
+     * <p>A nested array contributes each of its own elements as a command of its own,
+     * which is how the command handler has always been handed them.</p>
+     *
+     * @return the commands held in that range, empty when the bytes are not a RESP array
      */
     public List<String[]> deseralize(byte[] command, int from, int to){
-        try{
-            String data = new String(command, from, to - from, StandardCharsets.UTF_8);
-            char[] dataArr = data.toCharArray();
-            List<String[]> res = new ArrayList<>();
-
-            int i=0;
-            while(i < dataArr.length){
-
-                char curr = dataArr[i];
-
-                if(curr=='\u0000'){
-                    break;
-                }
-
-                if(curr == '*'){
-                    //array
-                    String arrLen = "";
-                    i++;
-                    while(i < dataArr.length && Character.isDigit(dataArr[i])){
-                        arrLen += dataArr[i++];
-                    }
-                    i+=2;
-                    if(dataArr[i] == '*'){
-                        // *2
-                        // *3\r\n#3set\r\n#3key\r\n#5value
-                        // *3\r\n#3set\r\n#3key\r\n#5value
-                        for(int t=0;t<Integer.parseInt(arrLen);t++){
-                            String nestedLen = "";
-                            i++;
-                            char c = dataArr[i];
-                            while(i < dataArr.length && Character.isDigit(dataArr[i])){
-
-                                nestedLen += dataArr[i++];
-                            }
-                            i+=2;
-                            String[] subArray = new String[Integer.parseInt(nestedLen)];
-                            i = getParts(dataArr, i, subArray);
-                            res.add(subArray);
-                        }
-                    }else{
-                        // *3\r\n#3set\r\n#3key\r\n#5value
-                        String[] subArray = new String[Integer.parseInt(arrLen)];
-                        i = getParts(dataArr, i, subArray);
-                        res.add(subArray);
-                    }
-                }
+        List<String[]> commands = new ArrayList<>();
+        int i = from;
+        while(i < to){
+            int read = readArray(command, i, to, commands);
+            if(read < 0){
+                logger.log(Level.WARNING, "stopped decoding at byte " + i + ": "
+                        + (read == INCOMPLETE_FRAME ? "the array is not all here yet" : "these bytes are not a RESP array"));
+                break;
             }
-            return res;
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, e.getMessage());
+            i += read;
         }
-        return new ArrayList<>();
+        return commands;
+    }
+
+    /**
+     * Reads one <code>*count\r\n</code> array of bulk strings starting at {@code from},
+     * appending what it holds to {@code out}.
+     *
+     * @return how many bytes the array occupies, or a negative {@link #frameLength} status.
+     *         Every branch either advances {@code i} or gives up, so no input can keep this
+     *         walking in circles
+     */
+    private int readArray(byte[] data, int from, int to, List<String[]> out){
+        if(from >= to){
+            return INCOMPLETE_FRAME;
+        }
+        if(data[from] != '*'){
+            return MALFORMED_FRAME;
+        }
+        int lineEnd = endOfLengthLine(data, from + 1, to);
+        if(lineEnd < 0){
+            return lineEnd;
+        }
+        int elements = parseLength(data, from + 1, lineEnd);
+        if(elements < 0){
+            return MALFORMED_FRAME;
+        }
+
+        int i = lineEnd + 2;
+        List<String> flat = new ArrayList<>(elements);
+        boolean nested = false;
+        for(int element = 0; element < elements; element++){
+            if(i >= to){
+                return INCOMPLETE_FRAME;
+            }
+            if(data[i] == '*'){
+                nested = true;
+                int read = readArray(data, i, to, out);
+                if(read < 0){
+                    return read;
+                }
+                i += read;
+                continue;
+            }
+
+            List<String> payload = new ArrayList<>(1);
+            int read = readBulkString(data, i, to, payload);
+            if(read < 0){
+                return read;
+            }
+            flat.add(payload.get(0));
+            i += read;
+        }
+
+        if(nested && !flat.isEmpty()){
+            // an array holding both nested commands and bare bulk strings has no single
+            // reading, and Redis refuses it as well
+            return MALFORMED_FRAME;
+        }
+        if(!nested){
+            out.add(flat.toArray(new String[0]));
+        }
+        return i - from;
+    }
+
+    /**
+     * Reads one <code>$length\r\npayload\r\n</code> bulk string starting at {@code from}
+     * and appends its decoded payload to {@code out}.
+     *
+     * @return how many bytes the bulk string occupies, or a negative {@link #frameLength}
+     *         status
+     */
+    private int readBulkString(byte[] data, int from, int to, List<String> out){
+        if(from >= to){
+            return INCOMPLETE_FRAME;
+        }
+        if(data[from] != '$'){
+            return MALFORMED_FRAME;
+        }
+        if(from + 1 < to && data[from + 1] == '-'){
+            // "$-1" is the null bulk string: a reply RedisForge writes, and never part of a
+            // command, so it is refused here instead of being taken for a length
+            return MALFORMED_FRAME;
+        }
+
+        int lineEnd = endOfLengthLine(data, from + 1, to);
+        if(lineEnd < 0){
+            return lineEnd;
+        }
+        int length = parseLength(data, from + 1, lineEnd);
+        if(length < 0){
+            return MALFORMED_FRAME;
+        }
+
+        int payloadStart = lineEnd + 2;
+        if(payloadStart + length > to){
+            // the payload is still arriving, or was cut short: there is nothing to decode
+            return INCOMPLETE_FRAME;
+        }
+        int terminator = endOfPayload(data, payloadStart + length, to);
+        if(terminator < 0){
+            return terminator;
+        }
+
+        out.add(new String(data, payloadStart, length, StandardCharsets.UTF_8));
+        return payloadStart - from + length + terminator;
+    }
+
+    /**
+     * Checks what closes a bulk string whose payload ends at {@code payloadEnd}. The end
+     * of the data counts as a close, so a stream that stops on a payload still counts as
+     * the whole array it belongs to, and the NUL this project has always used to close a
+     * frame is accepted too.
+     *
+     * @return how many bytes the closer takes, or a negative {@link #frameLength} status
+     */
+    private int endOfPayload(byte[] data, int payloadEnd, int to){
+        if(payloadEnd == to){
+            return 0;
+        }
+        if(data[payloadEnd] == '\r'){
+            if(payloadEnd + 1 >= to){
+                return INCOMPLETE_FRAME;
+            }
+            return data[payloadEnd + 1] == '\n' ? 2 : MALFORMED_FRAME;
+        }
+        if(data[payloadEnd] == 0){
+            return 1;
+        }
+        return MALFORMED_FRAME;
     }
 
     public String respInteger(int i){
@@ -223,33 +314,24 @@ public class RespSerializer {
         return String.join("",res);
     }
 
-    /**
+/**
      * Decodes one whole frame by byte count, which is how a RESP frame is written down.
      *
-     * <p>{@link #deseralize(byte[], int, int)} walks its input by characters, so a bulk
-     * string holding a multi byte character comes back with its payload shifted by one
-     * byte per character before it. A file that counts bytes has to be read back the same
-     * way, or a value that is not ASCII cannot survive a restart.</p>
+     * <p>The same reader serves the network and the append only file, so a value that was
+     * framed from the store comes back the way it went in whatever its bytes look
+     * like.</p>
      *
-     * @param data the bytes, from at a '*' through the end of the array
+     * @param data the bytes, from a '*' through the end of the array
      * @param to the end of this frame, which {@link #frameLength(byte[], int, int)} agreed on
-     * @return the array's elements
+     * @return the array's elements, empty when the bytes do not hold one whole array
      */
-    public String[] deserializeFrame(byte[] data, int from, int to) {
-        int elementsStart = from + 1;
-        int firstLengthLine = endOfLengthLine(data, elementsStart, to);
-        int elements = parseLength(data, elementsStart, firstLengthLine);
-        String[] frame = new String[elements];
-
-        int i = firstLengthLine + 2;
-        for (int element = 0; element < elements; element++) {
-            int lengthLine = endOfLengthLine(data, i + 1, to);
-            int length = parseLength(data, i + 1, lengthLine);
-            i = lengthLine + 2;
-            frame[element] = new String(data, i, length, StandardCharsets.UTF_8);
-            i += length + 2;
+    public String[] deserializeFrame(byte[] data, int from, int to){
+        List<String[]> commands = new ArrayList<>(1);
+        int read = readArray(data, from, to, commands);
+        if(read < 0 || commands.isEmpty()){
+            return new String[0];
         }
-        return frame;
+return commands.get(0);
     }
 
     public String[] parseArray(String[] parts) {

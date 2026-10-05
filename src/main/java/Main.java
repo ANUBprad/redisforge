@@ -1,12 +1,16 @@
+import Components.Persistence.AppendOnlyPersistence;
+import Components.Persistence.FsyncPolicy;
 import Components.Server.MasterTcpServer;
 import Components.Server.RedisConfig;
 import Components.Server.SlaveTcpServer;
 import Config.AppConfig;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
+import java.io.IOException;
+
 
 public class Main {
-    public static void main(String[] args){
+    public static void main(String[] args) throws IOException {
         AnnotationConfigApplicationContext context =
               new AnnotationConfigApplicationContext(AppConfig.class);
         MasterTcpServer master = context.getBean(MasterTcpServer.class);
@@ -32,13 +36,40 @@ public class Main {
                     redisConfig.setMasterPort(masterPort);
 
                     break;
+                case "--appendonly":
+                    redisConfig.setAppendonly(parseBoolean(args[i+1]));
+                    break;
+                case "--appendfilename":
+                    redisConfig.setAppendfilename(args[i+1]);
+                    break;
+                case "--appendfsync":
+                    // parsed here so a bad policy is refused before anything is opened
+                    redisConfig.setAppendfsync(FsyncPolicy.parse(args[i+1]).name().toLowerCase());
+                    break;
             }
         }
 
+        AppendOnlyPersistence appendOnly = context.getBean(AppendOnlyPersistence.class);
         if(redisConfig.getRole().equals("slave")){
             slave.startServer();
         }else{
+            // recovery runs before the listening socket exists, so the first client to
+            // connect already sees the recovered dataset. A file that cannot be trusted
+            // stops the server here instead of starting up with a dataset nobody asked for.
+            appendOnly.start();
+            // the file is flushed and closed on the way out, including on a signal
+            Runtime.getRuntime().addShutdownHook(new Thread(appendOnly::close, "appendonly-shutdown"));
             master.startServer();
         }
+    }
+
+    private static boolean parseBoolean(String value) {
+        if ("yes".equalsIgnoreCase(value) || "true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("no".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException("expected yes or no, got '" + value + "'");
     }
 }

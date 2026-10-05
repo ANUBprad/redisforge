@@ -4,7 +4,9 @@ import Components.Infra.Client;
 import Components.Service.RespSerializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -87,6 +89,45 @@ public class Store {
     }
 
     /**
+     * Sets a key with a deadline that is already fixed, which is how an expiry that was
+     * running when the server stopped is restored: the deadline was chosen when the key
+     * was written, so it must survive the restart instead of starting over.
+     */
+    public void setAt(String key, String val, long expiryEpochMillis){
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try{
+                LocalDateTime expiry = LocalDateTime.ofInstant(
+                        Instant.ofEpochMilli(expiryEpochMillis), ZoneId.systemDefault());
+                Value value = new Value(val, LocalDateTime.now(), expiry);
+                map.put(key, value);
+            } finally{
+                rwLock.writeLock().unlock();
+            }
+        }finally{
+            keyLock.unlock();
+        }
+    }
+
+    /** Removes a key outright, the way a committed DEL inside a transaction does. */
+    public void delete(String key) {
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try{
+                map.remove(key);
+            } finally{
+                rwLock.writeLock().unlock();
+            }
+        }finally{
+            keyLock.unlock();
+        }
+    }
+
+    /**
      * Reads, parses, adds one and stores again as one step. A concurrent map would still
      * lose increments here: two callers can both read the same value and both store the
      * same successor. The key's lock is what makes the whole thing indivisible.
@@ -157,6 +198,20 @@ public class Store {
         } catch (Exception e) {
             logger.log(Level.SEVERE, e.getMessage());
             return null;
+        }finally{
+            rwLock.readLock().unlock();
+        }
+    }
+
+    /**
+ * The entry as it is stored, whatever its deadline says. Unlike {@link #getValue(String)}
+ * this does not treat a key that has expired as gone, because the caller here wants the
+ * deadline itself: an expiry that has just passed still has to be recorded faithfully.
+ */
+public Value peekValue(String key) {
+        rwLock.readLock().lock();
+        try{
+            return map.get(key);
         }finally{
             rwLock.readLock().unlock();
         }

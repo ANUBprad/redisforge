@@ -2,6 +2,7 @@ package Components.Server;
 
 import Components.Infra.ConnectionPool;
 import Components.Infra.Slave;
+import Components.Persistence.AppendOnlyPersistence;
 import Components.Repository.Store;
 import Components.Repository.Value;
 import Components.Service.CommandHandler;
@@ -18,6 +19,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedList;
@@ -43,6 +45,8 @@ public class MasterTcpServer {
     private ConnectionPool connectionPool;
     @Autowired
     private Store store;
+    @Autowired
+    private AppendOnlyPersistence appendOnlyPersistence;
     public void startServer(){
         ServerSocket serverSocket = null;
         Socket clientSocket = null;
@@ -135,13 +139,20 @@ public class MasterTcpServer {
 
                 //execute the transaction
                 BiFunction<String[], Map<String, Value>, String> transactionCacheApplier = commandHandler.getTransactionCommandCacheApplier();
-                store.executeTransaction(client, transactionCacheApplier);
+                // the whole transaction is recorded under one hold of the file lock, right
+                // after the store applied it, so it lands in the file as one block and in
+                // the same order the store was changed in
+                appendOnlyPersistence.locked(() -> {
+                    store.executeTransaction(client, transactionCacheApplier);
+                    appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
+                    return null;
+                });
 
                 client.endTransaction();
                 while(!commands.isEmpty()){
                     String[] commandToPropagate = commands.poll();
                     String commandRespString = respSerializer.respArray(commandToPropagate);
-                    byte[] toCount = commandRespString.getBytes();
+                    byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
                     connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
                     propagate(commandToPropagate);
                 }
@@ -156,6 +167,27 @@ public class MasterTcpServer {
                 client.send("+OK\r\n");
                 break;
         }
+    }
+
+    /**
+     * The queued commands the transaction really applied, in order.
+     *
+     * <p>A transaction commits the commands that worked and skips the ones the store
+     * refused, so its replies say which those were. Recording a refused command would
+     * write down a change that never happened, and replaying it would fail all over
+     * again against a keyspace that is already correct.</p>
+     */
+    private List<String[]> appliedCommands(Client client, Queue<String[]> queued) {
+        List<String> replies = client.transactionResponse;
+        List<String[]> applied = new ArrayList<>(queued.size());
+        int index = 0;
+        for (String[] command : queued) {
+            if (index < replies.size() && !replies.get(index).startsWith("-")) {
+                applied.add(command);
+            }
+            index++;
+        }
+        return applied;
     }
 
     private void addCommandToTransaction(String[] command, Client client) throws IOException {
@@ -189,18 +221,25 @@ public class MasterTcpServer {
                 res = "+OK\r\n";
                 break;
             case "INCR": {
-                // applied and propagated inside one hold of the key's lock, so replicas
-                // see the increments of a key in the order this master applied them
+                // applied, recorded and propagated inside one hold of the key's lock, so
+                // replicas see the increments of a key in the order this master applied
+                // them, and the file records them in that same order
                 ReentrantLock keyLock = store.lockFor(command[1]);
                 keyLock.lock();
                 try {
-                    res = commandHandler.incr(command);
-                    // an increment that was refused is not a mutation, so it is not replicated
-                    if (!res.startsWith("-")) {
-                        String incrToPropagate = respSerializer.respArray(command);
-                        connectionPool.bytesSentToSlaves.addAndGet(incrToPropagate.getBytes().length);
-                        propagate(command);
-                    }
+                    res = appendOnlyPersistence.locked(() -> {
+                        String increment = commandHandler.incr(command);
+                        // an increment that was refused is not a mutation, so it is neither
+                        // written to the file nor replicated
+                        if (!increment.startsWith("-")) {
+                            appendOnlyPersistence.appendApplied(command);
+                            String incrToPropagate = respSerializer.respArray(command);
+                            connectionPool.bytesSentToSlaves.addAndGet(
+                                    incrToPropagate.getBytes(StandardCharsets.UTF_8).length);
+                            propagate(command);
+                        }
+                        return increment;
+                    });
                 } finally {
                     keyLock.unlock();
                 }
@@ -210,12 +249,20 @@ public class MasterTcpServer {
                 res = commandHandler.echo(command);
                 break;
             case "SET":
-                res = commandHandler.set(command);
-                String commandRespString = respSerializer.respArray(command);
-                byte[] toCount = commandRespString.getBytes();
-                connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
-                // on this thread, so replicas receive writes in the order they arrived
-                propagate(command);
+                res = appendOnlyPersistence.locked(() -> {
+                    String set = commandHandler.set(command);
+                    if (set.startsWith("+")) {
+                        // the store has the deadline the command asked for, so the entry
+                        // can be written with an absolute one
+                        appendOnlyPersistence.appendApplied(command);
+                    }
+                    String commandRespString = respSerializer.respArray(command);
+                    byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
+                    connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                    // on this thread, so replicas receive writes in the order they arrived
+                    propagate(command);
+                    return set;
+                });
                 break;
             case "GET":
                 res = commandHandler.get(command);
@@ -247,16 +294,18 @@ public class MasterTcpServer {
 
     private void propagate(String[] command) {
         String commandRespString = respSerializer.respArray(command);
+        // the same bytes the replicas are sent, so the offset counts what went over the wire
+        byte[] propagated = commandRespString.getBytes(StandardCharsets.UTF_8);
         // a copy, because a replica that cannot be written to is dropped on the way past
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
             System.out.println("========================= sending command down to slave ==============================");
             System.out.println("command: "+commandRespString);
             System.out.println(slave.connection.id);
             InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-            System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
+            System.out.println("Remote IP address: "+remoteAddress.getHostAddress()+":"+slave.connection.socket.getPort());
 
             try {
-                slave.send(commandRespString.getBytes());
+                slave.send(propagated);
             } catch (IOException e) {
                 // propagation runs on the connection's thread, so a replica that stops
                 // reading must not be allowed to break that connection

@@ -205,7 +205,10 @@ public class RespSerializer {
         int len = command.length;
         res.add("*"+len);
         for(String s: command){
-            len = s.length();
+            // the header counts bytes on the wire, not chars in the JVM: a value like
+            // "é" is two bytes in UTF-8, and framing it as one byte would shift
+            // everything that follows it
+            len = s.getBytes(StandardCharsets.UTF_8).length;
             res.add("$"+len);
             res.add(s);
         }
@@ -218,6 +221,35 @@ public class RespSerializer {
         res.add("*"+len+"\r\n");
         res.addAll(command);
         return String.join("",res);
+    }
+
+    /**
+     * Decodes one whole frame by byte count, which is how a RESP frame is written down.
+     *
+     * <p>{@link #deseralize(byte[], int, int)} walks its input by characters, so a bulk
+     * string holding a multi byte character comes back with its payload shifted by one
+     * byte per character before it. A file that counts bytes has to be read back the same
+     * way, or a value that is not ASCII cannot survive a restart.</p>
+     *
+     * @param data the bytes, from at a '*' through the end of the array
+     * @param to the end of this frame, which {@link #frameLength(byte[], int, int)} agreed on
+     * @return the array's elements
+     */
+    public String[] deserializeFrame(byte[] data, int from, int to) {
+        int elementsStart = from + 1;
+        int firstLengthLine = endOfLengthLine(data, elementsStart, to);
+        int elements = parseLength(data, elementsStart, firstLengthLine);
+        String[] frame = new String[elements];
+
+        int i = firstLengthLine + 2;
+        for (int element = 0; element < elements; element++) {
+            int lengthLine = endOfLengthLine(data, i + 1, to);
+            int length = parseLength(data, i + 1, lengthLine);
+            i = lengthLine + 2;
+            frame[element] = new String(data, i, length, StandardCharsets.UTF_8);
+            i += length + 2;
+        }
+        return frame;
     }
 
     public String[] parseArray(String[] parts) {

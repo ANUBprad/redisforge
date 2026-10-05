@@ -12,6 +12,9 @@ public class RedisConfig {
     private int port;
     private String masterHost;
     private int masterPort;
+    private boolean appendonly = false;
+    private String appendfilename = "appendonly.aof";
+    private String appendfsync = "everysec";
     private String masterReplId = null;
     // written by the upstream replication thread and read by whatever thread answers a
     // GETACK or reports on INFO
@@ -60,6 +63,10 @@ public class RedisConfig {
         return role;
     }
 
+    public boolean isMaster() {
+        return "master".equals(role);
+    }
+
     public int getPort() {
         return port;
     }
@@ -72,6 +79,28 @@ public class RedisConfig {
         this.port = port;
     }
 
+    public boolean isAppendonly() {
+        return appendonly;
+    }
 
+    public void setAppendonly(boolean appendonly) {
+        this.appendonly = appendonly;
+    }
+
+    public String getAppendfilename() {
+        return appendfilename;
+    }
+
+    public void setAppendfilename(String appendfilename) {
+        this.appendfilename = appendfilename;
+    }
+
+    public String getAppendfsync() {
+        return appendfsync;
+    }
+
+    public void setAppendfsync(String appendfsync) {
+        this.appendfsync = appendfsync;
+    }
 
 }

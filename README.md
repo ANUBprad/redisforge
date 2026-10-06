@@ -9,7 +9,8 @@ and asynchronous master/replica replication.
 - RESP protocol over a plain TCP socket
 - `PING`, `ECHO`, `GET`, `SET` (including `PX` millisecond expiry) and `INCR`
 - Transactions via `MULTI` / `EXEC` / `DISCARD`
-- Append-only file persistence on the master, replayed at startup
+- Append-only file persistence on the master, replayed at startup, compacted on demand
+  with `BGREWRITEAOF`
 - Replication: `REPLCONF`, `PSYNC` (full resync) and `WAIT`
 - Master and replica modes, with support for chained replication
 
@@ -83,6 +84,19 @@ java -jar target/redisforge.jar --appendonly yes --appendfilename data/appendonl
   truncated back to its last whole command. A file that is not a whole sequence of
   commands anywhere else is refused, and the server refuses to start rather than serve a
   keyspace it cannot vouch for.
+- The file can be compacted at any time with `BGREWRITEAOF`. The reply is `+OK` only
+  after the compact file is already on disk: it is built beside the original from the
+  state the store is holding now — one `SET` per live key, keeping each key's absolute
+  deadline and leaving out keys that have expired — forced whole, and then swapped into
+  place in a single step. A failure at any point leaves the file that was already there
+  and answers `-ERR` instead. The work happens before the reply, so the server is busy
+  for as long as the rewrite takes.
+- The rewrite runs under the same lock that records writes, so a write either lands in
+  the state the compact file describes or lands in the file the swap left behind; it
+  cannot be lost between the two. It is local maintenance: it is not sent to replicas,
+  and a replica or a master running with `--appendonly no` answers
+  `-ERR no append only file to rewrite`. The fsync policy keeps governing the writes
+  that come after the swap.
 
 Restarting the server with the same `--appendfilename` recovers the data:
 
@@ -121,7 +135,7 @@ image you published.
 ### Master
 
 `PING`, `ECHO`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO replication`,
-`REPLCONF`, `PSYNC`, `WAIT`
+`REPLCONF`, `PSYNC`, `WAIT`, `BGREWRITEAOF`
 
 `DEL` is only handled inside a transaction.
 
@@ -129,17 +143,27 @@ image you published.
 
 `PING`, `ECHO`, `GET`, `INFO replication`, `REPLCONF`, `PSYNC`, `WAIT`
 
-Write commands are rejected with `-READONLY`.
+Write commands are rejected with `-READONLY`. `BGREWRITEAOF` is recognized but refused
+with `-ERR no append only file to rewrite`, since a replica keeps no file of its own.
 
 ## Limitations
 
 - With `--appendonly no`, and always for a replica, data is held in memory only.
   Replication still performs a full resync and ships an empty RDB payload, so a replica
   restored that way starts empty until its master sends more.
-- There is no RDB snapshot and no rewrite: the append-only file only ever grows.
+- There is no RDB snapshot: recovery always replays the append-only file.
+  `BGREWRITEAOF` compacts it on demand, but nothing rewrites it in the background, so
+  between rewrites the file holds the full history of the writes it replays.
+- Replication is full-resync only. There is no replication backlog and no partial
+  resync: a replica that reconnects, or one that attaches later, is always resynced
+  from scratch with an empty payload.
+- No failover: a master that goes away is not replaced, and there is no Sentinel or
+  Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.
 - Keys expire lazily, when they are read. There is no background expiry sweep and no
   eviction policy.
+- Only the commands listed under [Supported commands](#supported-commands) are
+  implemented; RedisForge is not a drop-in replacement for Redis.
 
 ## Project layout
 

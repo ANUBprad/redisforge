@@ -221,13 +221,15 @@ public class MasterTcpServer {
                 res = "+OK\r\n";
                 break;
             case "INCR": {
-                // applied, recorded and propagated inside one hold of the key's lock, so
-                // replicas see the increments of a key in the order this master applied
-                // them, and the file records them in that same order
-                ReentrantLock keyLock = store.lockFor(command[1]);
-                keyLock.lock();
-                try {
-                    res = appendOnlyPersistence.locked(() -> {
+                // the file lock comes first and the key's lock inside it, which is the
+                // order a transaction takes them: applied, recorded and propagated under
+                // both, so replicas see the increments of a key in the order this master
+                // applied them, and an increment can never end up waiting for the file
+                // while a transaction holds it and waits for the key
+                res = appendOnlyPersistence.locked(() -> {
+                    ReentrantLock keyLock = store.lockFor(command[1]);
+                    keyLock.lock();
+                    try {
                         String increment = commandHandler.incr(command);
                         // an increment that was refused is not a mutation, so it is neither
                         // written to the file nor replicated
@@ -239,10 +241,10 @@ public class MasterTcpServer {
                             propagate(command);
                         }
                         return increment;
-                    });
-                } finally {
-                    keyLock.unlock();
-                }
+                    } finally {
+                        keyLock.unlock();
+                    }
+                });
                 break;
             }
             case "ECHO":

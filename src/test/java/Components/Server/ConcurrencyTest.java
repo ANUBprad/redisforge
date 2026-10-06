@@ -80,8 +80,8 @@ class ConcurrencyTest {
         // the master a moment to notice rather than failing the next test on its debris
         await(() -> connectionPool.getClients().isEmpty() && connectionPool.getSlaves().isEmpty(),
                 "the registry still holds a connection from an earlier test");
-        connectionPool.bytesSentToSlaves.set(0);
-        connectionPool.slavesThatAreCaughtUp.set(0);
+        connectionPool.resetCaughtUpAccounting();
+        redisConfig.setMasterReplOffset(0L);
     }
 
     @Test

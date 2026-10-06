@@ -1,6 +1,8 @@
 package Components.Server;
 
 import Components.Infra.ConnectionPool;
+import Components.Infra.Slave;
+import Components.Service.RespSerializer;
 import Config.AppConfig;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -16,11 +18,16 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -137,6 +144,75 @@ class ConnectionLifecycleTest {
         }
     }
 
+    @Test
+    void aReconnectReplacesTheRegistrationItAlreadyHad() throws Exception {
+        try (RespClient first = new RespClient(masterPort); RespClient second = new RespClient(masterPort)) {
+            first.send("REPLCONF", "listening-port", "6391");
+            assertEquals("+OK", first.read());
+            await(() -> connectionPool.getSlaves().size() == 1, "the first registration was not recorded");
+
+            // the same replica coming back before its old connection has been cleaned up,
+            // which is what a reconnect that arrived quickly looks like
+            second.send("REPLCONF", "listening-port", "6391");
+            assertEquals("+OK", second.read());
+
+            await(() -> connectionPool.getSlaves().size() == 1,
+                    "the reconnect was registered beside the connection it replaces, so one replica holds two streams");
+            Slave registered = connectionPool.getSlaves().iterator().next();
+            assertEquals(second.localPort(), registered.connection.socket.getPort(),
+                    "the registry still holds the connection the reconnect replaced");
+            try {
+                assertNull(first.read(), "the replaced connection was left open, so it would be written to twice");
+            } catch (SocketTimeoutException neverClosed) {
+                fail("the replaced connection was never closed, so the replica would be written to twice");
+            }
+        }
+    }
+
+    @Test
+    void aMasterCountsTheWritesItPropagatesIntoItsOffset() throws Exception {
+        long before = redisConfig.getMasterReplOffset().longValue();
+        try (RespClient replica = new RespClient(masterPort); RespClient client = new RespClient(masterPort)) {
+            replica.send("REPLCONF", "listening-port", "6392");
+            assertEquals("+OK", replica.read());
+            await(() -> connectionPool.getSlaves().size() == 1, "the replica never registered");
+
+            client.send("SET", "offset:counted", "value");
+            assertEquals("+OK", client.read());
+
+            long expected = before + frameLength("SET", "offset:counted", "value");
+            assertEquals(expected, redisConfig.getMasterReplOffset().longValue(),
+                    "the master did not count the write it propagated, so it would report offset 0 forever");
+
+            // the number this master hands a replica, and the number that replica has to
+            // give back, is the number it just counted
+            replica.send("REPLCONF", "GETACK", "*");
+            assertEquals(List.of("REPLCONF", "ACK", Long.toString(expected)), readArray(replica),
+                    "the master answered GETACK with an offset it never counted");
+        }
+    }
+
+    /** The bytes a command travels as, which is what the offset has to count. */
+    private static int frameLength(String... parts) {
+        return new RespSerializer().respArray(parts).getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    /** Reads a whole array reply, so a GETACK answer can be compared element by element. */
+    private static List<String> readArray(RespClient client) throws IOException {
+        String header = client.read();
+        assertTrue(header.startsWith("*"), "expected an array reply but read: " + header);
+        List<String> parts = new ArrayList<>();
+        for (int i = 0; i < Integer.parseInt(header.substring(1)); i++) {
+            String bulk = client.read();
+            assertTrue(bulk.startsWith("$"), "expected a bulk element but read: " + bulk);
+            String content = client.read();
+            assertEquals(Integer.parseInt(bulk.substring(1)), content.length(),
+                    "the bulk header did not match what arrived: " + content);
+            parts.add(content);
+        }
+        return parts;
+    }
+
     private static int freePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
@@ -191,6 +267,11 @@ class ConnectionLifecycleTest {
 
         String read() throws IOException {
             return reader.readLine();
+        }
+
+        /** The port this side is connected from, which is what a server sees us as. */
+        int localPort() {
+            return socket.getLocalPort();
         }
 
         @Override

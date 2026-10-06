@@ -39,6 +39,20 @@ public class RedisConfig {
         return masterReplOffset;
     }
 
+    /**
+     * Records that bytes of the replication stream have gone out, and returns the offset the
+     * stream has now reached.
+     *
+     * <p>This is the only place the offset moves, and it counts the same bytes that are
+     * written to replicas: a master advances it for the writes it propagates, and a replica
+     * for the writes it applies and passes on. Handshake and control traffic never goes
+     * through here, so the offset stays a position in the write stream and nothing else.</p>
+     */
+    public long recordReplicatedBytes(int bytes) {
+        masterReplOffset = getMasterReplOffset() + bytes;
+        return masterReplOffset;
+    }
+
     public void setMasterReplOffset(Long masterReplOffset) {
         this.masterReplOffset = masterReplOffset;
     }

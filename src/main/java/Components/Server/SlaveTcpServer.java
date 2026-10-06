@@ -255,8 +255,7 @@ public class SlaveTcpServer {
                     // from here compares equal against the master's own count. It counts
                     // the bytes the command travels as, in the same encoding, so the two
                     // sides of a hop can never disagree about how far the other has got
-                    redisConfig.setMasterReplOffset(redisConfig.getMasterReplOffset()
-                            + replicatedBytes(command).length);
+                    redisConfig.recordReplicatedBytes(replicatedBytes(command).length);
                 }
             }
         }
@@ -274,6 +273,25 @@ public class SlaveTcpServer {
             throw new IOException("expected +FULLRESYNC from the master but read: " + status);
         }
         logger.log(Level.FINE, status);
+
+        // take the master's offset as the position this hop starts from. Everything the
+        // master has streamed so far, including what this replica missed while it was away,
+        // is behind that number, so this is where its own stream now stands
+        String[] fullResync = status.split(" ");
+        if(fullResync.length < 3){
+            throw new IOException("+FULLRESYNC without a replication id and offset: " + status);
+        }
+        long adopted = Long.parseLong(fullResync[2]);
+        if(adopted != redisConfig.getMasterReplOffset()){
+            // a position that moved means a new stream, not a resumed one: a master that
+            // restarted counts from nothing again, and what was streamed here while this
+            // hop was away is behind it. The replicas below this hop still carry the old
+            // stream, so they are let go of and attach again from this position, which is
+            // what keeps a chain naming one stream instead of two
+            connectionPool.dropDownstreamReplicas();
+        }
+        redisConfig.setMasterReplId(fullResync[1]);
+        redisConfig.setMasterReplOffset(adopted);
 
         String header = readLine(inputStream);
         if(header == null || !header.startsWith("$")){
@@ -321,11 +339,11 @@ public class SlaveTcpServer {
         switch (cmd){
             case "SET":
                 commandHandler.set(command);
-                countAndPropagate(command);
+                passOn(command);
                 break;
             case "INCR":
                 commandHandler.incr(command);
-                countAndPropagate(command);
+                passOn(command);
                 break;
             case "DEL":
                 applyDeleteFromMaster(command);
@@ -358,16 +376,19 @@ public class SlaveTcpServer {
             return;
         }
         store.delete(command[1]);
-        countAndPropagate(command);
+        passOn(command);
     }
 
     /**
-     * Counts the bytes this replica sent onwards and passes the write to the next hop, so
-     * a chained replica sees every write exactly once and WAIT counts what actually went
-     * over the wire.
+     * Passes an applied write to the next hop, so a chained replica sees every write
+     * exactly once.
+     *
+     * <p>The offset is not counted here. This hop counts the bytes it received from its
+     * master, which are the same bytes it passes on, so counting on both sides would count
+     * every write of a chain twice and leave a replica's ACK naming a number its own master
+     * never reached.</p>
      */
-    private void countAndPropagate(String[] command) {
-        connectionPool.bytesSentToSlaves.addAndGet(replicatedBytes(command).length);
+    private void passOn(String[] command) {
         propagate(command);
     }
 
@@ -458,14 +479,14 @@ public class SlaveTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(connectionPool.bytesSentToSlaves.get() == 0){
+                if(redisConfig.getMasterReplOffset() == 0){
                     res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
                     break;
                 }
 
                 Instant start = Instant.now();
                 res = commandHandler.wait(command, start);
-                connectionPool.slavesThatAreCaughtUp.set(0);
+                connectionPool.resetCaughtUpAccounting();
                 break;
         }
         client.send(res, data);

@@ -153,7 +153,7 @@ public class MasterTcpServer {
                     String[] commandToPropagate = commands.poll();
                     String commandRespString = respSerializer.respArray(commandToPropagate);
                     byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
-                    connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                    redisConfig.recordReplicatedBytes(toCount.length);
                     propagate(commandToPropagate);
                 }
 
@@ -234,7 +234,7 @@ public class MasterTcpServer {
                         if (!increment.startsWith("-")) {
                             appendOnlyPersistence.appendApplied(command);
                             String incrToPropagate = respSerializer.respArray(command);
-                            connectionPool.bytesSentToSlaves.addAndGet(
+                            redisConfig.recordReplicatedBytes(
                                     incrToPropagate.getBytes(StandardCharsets.UTF_8).length);
                             propagate(command);
                         }
@@ -258,7 +258,7 @@ public class MasterTcpServer {
                     }
                     String commandRespString = respSerializer.respArray(command);
                     byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
-                    connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                    redisConfig.recordReplicatedBytes(toCount.length);
                     // on this thread, so replicas receive writes in the order they arrived
                     propagate(command);
                     return set;
@@ -274,13 +274,13 @@ public class MasterTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(connectionPool.bytesSentToSlaves.get() == 0){
+                if(redisConfig.getMasterReplOffset() == 0){
                     res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
                     break;
                 }
                 Instant start = Instant.now();
                 res = commandHandler.wait(command, start);
-                connectionPool.slavesThatAreCaughtUp.set(0);
+                connectionPool.resetCaughtUpAccounting();
                 break;
             case "PSYNC":
                 ResponseDto resDto = commandHandler.psync(command, client);

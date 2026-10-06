@@ -102,8 +102,7 @@ class ChainedReplicationTest {
     @BeforeEach
     void resetReplicaState() throws Exception {
         await(() -> connectionPool.getSlaves().isEmpty(), "a replica from an earlier test is still registered");
-        connectionPool.slavesThatAreCaughtUp.set(0);
-        connectionPool.bytesSentToSlaves.set(0);
+        connectionPool.resetCaughtUpAccounting();
         redisConfig.setMasterReplOffset(0L);
     }
 
@@ -137,8 +136,8 @@ class ChainedReplicationTest {
     void replconfAckMatchingTheStreamCountsTheReplicaAsCaughtUp() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);
-            connectionPool.slavesThatAreCaughtUp.set(0);
-            connectionPool.bytesSentToSlaves.set(42);
+            connectionPool.resetCaughtUpAccounting();
+            redisConfig.setMasterReplOffset(42L);
 
             downstream.send(frame("REPLCONF", "ACK", "42"));
 
@@ -153,8 +152,8 @@ class ChainedReplicationTest {
     void replconfAckThatDoesNotMatchTheStreamCountsNothing() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);
-            connectionPool.slavesThatAreCaughtUp.set(0);
-            connectionPool.bytesSentToSlaves.set(42);
+            connectionPool.resetCaughtUpAccounting();
+            redisConfig.setMasterReplOffset(42L);
 
             downstream.send(frame("REPLCONF", "ACK", "7"));
 
@@ -301,6 +300,64 @@ class ChainedReplicationTest {
     }
 
     @Test
+    void aReplicaCountsOnceForAWaitNoMatterHowOftenItAcknowledges() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            byte[] write = frame("SET", "chain:wait:twice", "acknowledged");
+            feed(write);
+
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "5000"));
+                downstream.readControlFrame();
+                downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+                assertEquals(":1", client.readReply(), "the replica that acknowledged was not counted");
+            }
+
+            // the same replica acknowledging again cannot stand in for a second one, which
+            // is what WAIT 2 asks for: the count has to stay the number of replicas
+            downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+            downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "2", "150"));
+                downstream.readControlFrame();
+                assertEquals(":1", client.readReply(),
+                        "one replica acknowledged twice and was counted as two");
+            }
+        }
+    }
+
+    @Test
+    void anAcknowledgementNamingAnEarlierOffsetDoesNotSatisfyALaterWait() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            byte[] first = frame("SET", "chain:wait:stale", "one");
+            feed(first);
+
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "5000"));
+                downstream.readControlFrame();
+                downstream.send(frame("REPLCONF", "ACK", "" + first.length));
+                assertEquals(":1", client.readReply(), "the replica that acknowledged was not counted");
+            }
+
+            // the stream moves on, so the acknowledgement the replica already sent names a
+            // position it has been passed by
+            byte[] second = frame("SET", "chain:wait:stale", "two");
+            feed(second);
+            assertEquals(first.length + second.length, redisConfig.getMasterReplOffset().longValue(),
+                    "the write after the first acknowledgement did not move the offset");
+
+            downstream.send(frame("REPLCONF", "ACK", "" + first.length));
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "150"));
+                downstream.readControlFrame();
+                assertEquals(":0", client.readReply(),
+                        "an acknowledgement for an offset the stream had already passed satisfied a later WAIT");
+            }
+        }
+    }
+
+    @Test
     void incrementsReceivedFromTheMasterAreAppliedAndPropagated() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);
@@ -421,9 +478,9 @@ class ChainedReplicationTest {
             // matches this hop's number and WAIT counts the delete like any other write
             long expected = frame("SET", "chain:counted-delete", "value").length
                     + frame("DEL", "chain:counted-delete").length;
+            // one number: it is both where this hop's stream stands and how many bytes the
+            // next hop has been sent
             assertEquals(expected, redisConfig.getMasterReplOffset().longValue(),
-                    "the offset does not match the bytes this replica counted");
-            assertEquals(expected, connectionPool.bytesSentToSlaves.get(),
                     "the bytes sent onwards do not match the frames that were propagated");
             assertEquals(2, downstream.readFramesUntilAck().size());
         }

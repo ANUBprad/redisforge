@@ -193,6 +193,92 @@ class ReplicaRecoveryTest {
     }
 
     @Test
+    void aReplicaKeepsItsOffsetInStepWithItsMasterAcrossAReconnect() throws Exception {
+        int masterPort = freePort();
+        Node master = startMaster(masterPort);
+        master.awaitPortOpen();
+        Node replica = startReplica(freePort(), masterPort);
+        replica.awaitPortOpen();
+
+        awaitRegisteredAndReady(master, 1);
+        set(master.port, "recover:offset", "before the link went away");
+        awaitValue(replica, "recover:offset", "before the link went away");
+
+        long afterFirstWrite = reportedOffset(master.port);
+        assertTrue(afterFirstWrite > 0, "the master never counted the write it propagated");
+        await(() -> offsetOrMinusOne(replica.port) == afterFirstWrite,
+                "the replica did not report the offset its master counted for the write it applied");
+
+        // the link goes away. The master keeps serving, so it streams past where the replica
+        // stands: nothing backfills the gap, but the position both name afterwards must
+        // still be the same one
+        closeUpstream(master);
+        awaitAttached(master, 0);
+        set(master.port, "recover:offset", "written while the replica was away");
+        awaitAttached(master, 1);
+
+        set(master.port, "recover:offset", "after the link came back");
+        awaitValue(replica, "recover:offset", "after the link came back");
+
+        // a full resync starts the replica from the position the master says the stream is
+        // at, and every write after that moves both by the same bytes, so a reconnect
+        // cannot leave them naming two different positions
+        await(() -> {
+            long masterOffset = offsetOrMinusOne(master.port);
+            long replicaOffset = offsetOrMinusOne(replica.port);
+            return masterOffset > 0 && masterOffset == replicaOffset;
+        }, "the replica's offset diverged from its master after it reconnected: master "
+                + offsetOrMinusOne(master.port) + ", replica " + offsetOrMinusOne(replica.port));
+    }
+
+    /**
+     * A full resync moves this hop to a new position in a new stream. A replica below is
+     * still carrying the old one, so it has to attach again from the new position rather
+     * than go on naming a stream that no longer exists.
+     */
+    @Test
+    void aReplicaLetsGoOfTheReplicasBelowItWhenItsStreamIsReplaced() throws Exception {
+        int masterPort = freePort();
+        int replicaPort = freePort();
+        Node replica = startReplica(replicaPort, masterPort);
+        replica.awaitPortOpen();
+
+        try (ScriptedMaster scripted = new ScriptedMaster(masterPort, replicaPort)) {
+            scripted.attach();
+            scripted.handshake();
+            scripted.stream(frame("INCR", "replaced:counter"));
+            awaitValue(replica, "replaced:counter", "1");
+
+            // a replica below attaches while this hop is still on the stream it started with
+            try (RespSocket below = new RespSocket(replicaPort)) {
+                below.send(frame("REPLCONF", "listening-port", "" + freePort()));
+                assertEquals("+OK", below.readReply(), "the replica below was refused");
+                await(() -> replica.slaveCount() == 1, "the replica below never registered");
+
+                // the master hangs up and hands over a stream that starts from somewhere
+                // else. This hop takes the new position, and the one below still carries the
+                // old one, so it is let go of: kept as it is, an ACK from below would name a
+                // stream this hop no longer follows and a WAIT here could never count it
+                scripted.hangUp();
+                scripted.attach();
+                scripted.handshake();
+
+                await(() -> {
+                    try {
+                        below.send(frame("PING"));
+                        below.readReply();
+                        return false;
+                    } catch (IOException gone) {
+                        return true;
+                    }
+                }, "the replica below was still held on a stream that no longer exists");
+                assertEquals(0, replica.slaveCount(),
+                        "the connection that was let go of is still held as a replica");
+            }
+        }
+    }
+
+    @Test
     void theHandshakeIsRunAgainOnEveryReconnectAndNoStreamIsAppliedTwice() throws Exception {
         int masterPort = freePort();
         Node replica = startReplica(freePort(), masterPort);
@@ -421,7 +507,9 @@ class ReplicaRecoveryTest {
             write("+OK");
             assertArrayEquals(new String[]{"PSYNC", "?", "-1"}, request(),
                     "the attachment did not ask for a full resync");
-            write("+FULLRESYNC scriptedreplid 0:0");
+            // the offset is the position in the write stream, as our own master and real Redis
+            // both send it: a plain number the replica can pick its own stream up from
+            write("+FULLRESYNC scriptedreplid 0");
             byte[] rdb = java.util.Base64.getDecoder().decode(EMPTY_RDB_BASE64);
             write("$" + rdb.length);
             out.write(rdb);
@@ -475,6 +563,15 @@ class ReplicaRecoveryTest {
 
     // ------------------------------------------------------------- actions
 
+    /** The offset a node reports, or -1 when it could not be asked, for use inside a wait. */
+    private static long offsetOrMinusOne(int port) {
+        try {
+            return reportedOffset(port);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     private void set(int port, String key, String value) throws Exception {
         try (RespSocket client = new RespSocket(port)) {
             client.send(frame("SET", key, value));
@@ -494,6 +591,23 @@ class ReplicaRecoveryTest {
         try (RespSocket client = new RespSocket(port)) {
             client.send(frame("GET", key));
             return client.readValue();
+        }
+    }
+
+    /**
+     * The offset a node reports for its write stream, read the way a replica reads it from
+     * INFO, so a test compares the two numbers each side actually hands out.
+     */
+    private static long reportedOffset(int port) throws Exception {
+        try (RespSocket client = new RespSocket(port)) {
+            client.send(frame("INFO", "replication"));
+            String info = client.readValue();
+            for (String line : info.split("\r\n")) {
+                if (line.startsWith("master_repl_offset:")) {
+                    return Long.parseLong(line.substring("master_repl_offset:".length()));
+                }
+            }
+            throw new AssertionError("INFO reported no master_repl_offset: " + info);
         }
     }
 

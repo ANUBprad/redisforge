@@ -90,14 +90,32 @@ public class CommandHandler {
                 String [] replconfAck = new String[]{"REPLCONF", "ACK", redisConfig.getMasterReplOffset()+""};
                 return respSerializer.respArray(replconfAck);
             case "ACK":
-                int ackResponse = Integer.parseInt(command[2]);
-                connectionPool.slaveAck(ackResponse);
-//                break;
+                long ackOffset = Long.parseLong(command[2]);
+                // an acknowledgement only means something from a replica whose stream has
+                // started, and only for the position the write stream has actually reached:
+                // one naming an earlier position is a replica that has not caught up yet
+                Slave replica = connectionPool.slaveFor(client);
+                if(replica != null && replica.isReady()
+                        && ackOffset == redisConfig.getMasterReplOffset()
+                        && replica.markAcknowledged()){
+                    connectionPool.slavesThatAreCaughtUp.incrementAndGet();
+                }
                 return "";
             case "listening-port":
+                int listeningPort = Integer.parseInt(command[2]);
+                // one registration per replica. A reconnect can arrive while the connection it
+                // replaces is still being cleaned up, and two entries for one replica would
+                // mean every write was sent to it twice, so the earlier one is dropped and its
+                // socket closed: the replica ends up with exactly one stream
+                Slave previous = connectionPool.slaveAtPort(listeningPort, client);
                 connectionPool.removeClient(client);
-                Slave s = new Slave(client);
+                Slave s = new Slave(client, listeningPort);
                 connectionPool.addSlave(s);
+                if(previous != null){
+                    connectionPool.removeSlave(previous);
+                    // the stale connection's read ends here, which unwinds its own handler
+                    previous.connection.close();
+                }
                 return "+OK\r\n";
 
             case "capa":
@@ -139,7 +157,8 @@ public class CommandHandler {
             String fullResyncHeader = "$"+ length +"\r\n";
             byte[] header = fullResyncHeader.getBytes();
 
-            connectionPool.slavesThatAreCaughtUp.incrementAndGet();
+            // PSYNC is control traffic: it says a replica has attached, not that it has
+            // consumed a write, so it must not count towards a WAIT
 
             // the replica's command stream starts here, and only from this point can it be
             // sent writes. It registered itself earlier, when it gave its listening port, and
@@ -189,7 +208,7 @@ public class CommandHandler {
                 break;
             res= connectionPool.slavesThatAreCaughtUp.get();
         }
-        // bytesSentToSlaves counts replicated writes only. Folding the GETACK into it would
+        // the offset counts replicated writes only. Folding the GETACK into it would
         // push it past the offset a replica reports back, and the next ACK would never match
         if(res > required)
             return respSerializer.respInteger(required);

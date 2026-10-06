@@ -362,6 +362,50 @@ class AofServerTest {
     }
 
     @Test
+    void aRewriteTriggerCompactsTheFileAndTheStateStaysPut() throws Exception {
+        try (RespSocket client = new RespSocket(masterPort)) {
+            for (int i = 1; i <= 6; i++) {
+                client.send(frame("SET", "aof:rw:churn", "v" + i));
+                assertEquals("+OK", client.readReply());
+            }
+            client.send(frame("SET", "aof:rw:kept", "steady"));
+            assertEquals("+OK", client.readReply());
+        }
+
+        int before = frames().size();
+        assertTrue(before >= 7, "the history was not written to begin with: " + before);
+
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("BGREWRITEAOF"));
+            assertEquals("+OK", client.readReply(), "the rewrite trigger did not answer");
+        }
+
+        List<String[]> after = frames();
+        assertTrue(after.size() < before,
+                "the file did not shrink on a rewrite: " + before + " -> " + after.size());
+        for (String[] written : after) {
+            assertFalse(written[0].equals("INCR"),
+                    "a history entry survived the rewrite: " + String.join(" ", written));
+        }
+
+        // the compacted file replays into the state the clients left behind
+        Store recovered = replayIntoNewStore();
+        assertEquals("v6", recovered.getValue("aof:rw:churn").val,
+                "the rewrite kept an older value than the clients wrote");
+        assertEquals("steady", recovered.getValue("aof:rw:kept").val);
+
+        // and the server keeps appending to the file it swapped in
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("SET", "aof:rw:after", "written"));
+            assertEquals("+OK", client.readReply());
+            client.send(frame("GET", "aof:rw:after"));
+            assertEquals("$7\r\nwritten\r\n", client.readReply());
+        }
+        assertEquals("written", replayIntoNewStore().getValue("aof:rw:after").val,
+                "a write after the rewrite never reached the file");
+    }
+
+    @Test
     void aTransactionOfOnlyReadsIsNotWrittenToTheFile() throws Exception {
         try (RespSocket client = new RespSocket(masterPort)) {
             client.send(frame("SET", "aof:onlyread", "value"));

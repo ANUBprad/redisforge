@@ -287,10 +287,31 @@ public class MasterTcpServer {
                 res = resDto.response;
                 data = resDto.data;
                 break;
+            case "BGREWRITEAOF":
+                res = rewriteAppendOnlyFile();
+                break;
         }
         return new ResponseDto(res, data);
     }
 
+    /**
+     * The explicit trigger for a rewrite. The work is done before the reply, so a client
+     * that has its +OK knows the file on disk is already the compact one. The name is the
+     * one Redis uses; nothing here runs in the background.
+     */
+    private String rewriteAppendOnlyFile() {
+        if (!appendOnlyPersistence.isEnabled()) {
+            return "-ERR no append only file to rewrite\r\n";
+        }
+        try {
+            appendOnlyPersistence.rewrite();
+            return "+OK\r\n";
+        } catch (RuntimeException e) {
+            // the client gets told what went wrong, rather than the connection dying on it
+            logger.log(Level.WARNING, "could not rewrite the append only file: " + e.getMessage());
+            return "-ERR " + e.getMessage().replaceAll("[\\r\\n]+", " ") + "\r\n";
+        }
+    }
 
     private void propagate(String[] command) {
         String commandRespString = respSerializer.respArray(command);

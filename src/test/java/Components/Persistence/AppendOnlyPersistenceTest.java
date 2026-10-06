@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -21,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -303,6 +305,178 @@ class AppendOnlyPersistenceTest {
     }
 
     @Test
+    void aRewriteKeepsTheStateAndDropsTheHistory(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "always"), store);
+
+        // the same key written over and over, which is what makes a file grow
+        for (int i = 1; i <= 5; i++) {
+            store.set("churn", "v" + i);
+            aof.appendApplied(new String[]{"SET", "churn", "v" + i});
+        }
+        store.set("keep", "steady");
+        aof.appendApplied(new String[]{"SET", "keep", "steady"});
+        assertEquals(6, frames(file).size(), "the history was not written down to begin with");
+
+        assertEquals(2, aof.rewrite(), "the rewrite did not describe every live key");
+        aof.close();
+
+        List<String[]> rewritten = frames(file);
+        assertEquals(2, rewritten.size(), "the history survived the rewrite");
+        Store replayed = replay(file);
+        assertEquals("v5", replayed.getValue("churn").val,
+                "the rewrite kept an older value than the store holds");
+        assertEquals("steady", replayed.getValue("keep").val);
+    }
+
+    @Test
+    void aRewriteKeepsTheAbsoluteDeadlineOfAnExpiringKey(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "everysec"), store);
+
+        store.set("temporary", "value", 600_000);
+        aof.appendApplied(new String[]{"SET", "temporary", "value", "px", "600000"});
+        long deadline = Long.parseLong(frames(file).get(0)[4]);
+
+        assertEquals(1, aof.rewrite());
+        aof.close();
+
+        String[] rewritten = frames(file).get(0);
+        assertEquals(5, rewritten.length, "the expiry was dropped: " + String.join(" ", rewritten));
+        assertEquals("PXAT", rewritten[3], "the deadline was not carried over: "
+                + String.join(" ", rewritten));
+        assertEquals(String.valueOf(deadline), rewritten[4],
+                "the deadline moved, so the key would expire at a different time");
+
+        Store replayed = replay(file);
+        long replayedDeadline = replayed.getValue("temporary").expiry
+                .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        assertEquals(deadline, replayedDeadline, "the key came back with a different deadline");
+    }
+
+    @Test
+    void aRewriteLeavesOutKeysWhoseDeadlineHadAlreadyPassed(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "no"), store);
+
+        store.setAt("already-gone", "value", System.currentTimeMillis() - 60_000);
+        store.set("still-here", "value");
+
+        assertEquals(1, aof.rewrite(), "a key whose deadline had passed was written down");
+        aof.close();
+
+        assertArrayEquals(new String[]{"SET", "still-here", "value"}, frames(file).get(0));
+        Store replayed = replay(file);
+        assertNull(replayed.getValue("already-gone"), "an expired key came back from the rewrite");
+        assertEquals("value", replayed.getValue("still-here").val);
+    }
+
+    @Test
+    void aRewriteLeavesOnlyTheAppendOnlyFileBehind(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "always"), store);
+
+        store.set("k", "v");
+        aof.appendApplied(new String[]{"SET", "k", "v"});
+        aof.rewrite();
+
+        try (var listed = Files.list(dir)) {
+            assertEquals(List.of("appendonly.aof"),
+                    listed.map(path -> path.getFileName().toString()).sorted().toList(),
+                    "the rewrite left files beside the append only file");
+        }
+        aof.close();
+    }
+
+    @Test
+    void writesThatArriveWhileARewriteRunsAreNeverLost(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "no"), store);
+
+        int writers = 4;
+        int writesPerWriter = 120;
+        int rewrites = 25;
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(writers + 1);
+        for (int writer = 0; writer < writers; writer++) {
+            int id = writer;
+            pool.submit(() -> {
+                awaitQuietly(start);
+                for (int i = 0; i < writesPerWriter; i++) {
+                    final int write = i;
+                    // the pattern the server itself uses: store and file, one hold of the lock
+                    aof.locked(() -> {
+                        store.set("rw:" + id, "v" + write);
+                        aof.appendApplied(new String[]{"SET", "rw:" + id, "v" + write});
+                        return null;
+                    });
+                }
+                return null;
+            });
+        }
+        pool.submit(() -> {
+            awaitQuietly(start);
+            for (int i = 0; i < rewrites; i++) {
+                aof.rewrite();
+            }
+            return null;
+        });
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS),
+                "the writers and the rewrites did not finish");
+        // one last rewrite, so the file is exactly the state the writers left behind
+        assertEquals(writers, aof.rewrite(), "the final rewrite did not describe every key");
+        aof.close();
+
+        Store replayed = replay(file);
+        for (int writer = 0; writer < writers; writer++) {
+            assertEquals("v" + (writesPerWriter - 1), replayed.getValue("rw:" + writer).val,
+                    "a write from writer " + writer + " was lost across a rewrite");
+        }
+    }
+
+    @Test
+    void appendsKeepFollowingTheFsyncPolicyAfterARewrite(@TempDir Path dir) throws Exception {
+        for (String policy : List.of("always", "everysec", "no")) {
+            Path file = dir.resolve("appendonly-" + policy + ".aof");
+            Store store = newStore();
+            AppendOnlyPersistence aof = started(masterConfig(file, policy), store);
+
+            store.set("before", policy);
+            aof.appendApplied(new String[]{"SET", "before", policy});
+            assertEquals(1, aof.rewrite(), "appendfsync " + policy + " rewrote nothing");
+            store.set("after", policy);
+            aof.appendApplied(new String[]{"SET", "after", policy});
+            aof.close();
+
+            Store replayed = replay(file);
+            assertEquals(policy, replayed.getValue("before").val,
+                    "the entry before the rewrite was lost under appendfsync " + policy);
+            assertEquals(policy, replayed.getValue("after").val,
+                    "an entry after the rewrite was lost under appendfsync " + policy);
+        }
+    }
+
+    @Test
+    void aRewriteIsRefusedWhenThereIsNoFile(@TempDir Path dir) {
+        RedisConfig config = new RedisConfig();
+        config.setRole("master");
+        config.setAppendfilename(dir.resolve("appendonly.aof").toString());
+        Store store = newStore();
+        AppendOnlyPersistence aof = new AppendOnlyPersistence(config, store);
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, aof::rewrite);
+        assertTrue(e.getMessage().contains("no append only file"),
+                "the refusal does not say what was wrong: " + e.getMessage());
+    }
+
+    @Test
     void anUnknownFsyncPolicyIsRefused() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> FsyncPolicy.parse("whenever"));
@@ -329,6 +503,14 @@ class AppendOnlyPersistenceTest {
         AppendOnlyPersistence aof = new AppendOnlyPersistence(config, store);
         aof.start();
         return aof;
+    }
+
+    /** A fresh store replayed from the file, which is what a restarted server would hold. */
+    private Store replay(Path file) throws IOException {
+        Store fresh = newStore();
+        AppendOnlyPersistence second = started(masterConfig(file, "always"), fresh);
+        second.close();
+        return fresh;
     }
 
     /** Every whole frame in the file, in the order it was written. */

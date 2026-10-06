@@ -488,6 +488,12 @@ public class SlaveTcpServer {
                 res = commandHandler.wait(command, start);
                 connectionPool.resetCaughtUpAccounting();
                 break;
+            case "BGREWRITEAOF":
+                // a replica keeps no file of its own: what it holds came from its master's
+                // stream, so there is nothing here for a local rewrite to compact. The reply
+                // matters, because a client that gets no answer waits forever.
+                res = "-ERR no append only file to rewrite\r\n";
+                break;
         }
         client.send(res, data);
     }

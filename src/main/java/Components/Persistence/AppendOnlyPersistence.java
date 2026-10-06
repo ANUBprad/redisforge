@@ -13,6 +13,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -193,6 +195,133 @@ public class AppendOnlyPersistence {
             append(block.toString());
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * Replaces the file with one that describes the state the store is holding now, instead
+     * of every command that ever led to it. This is local maintenance: it changes what is on
+     * disk, never what is in the store, and it is not replicated.
+     *
+     * <p>The snapshot is taken under the same lock that records mutations, so a write either
+     * lands in the store before the snapshot reads it, or appends to the file the snapshot
+     * replaced; there is nowhere else for it to end up. The new file is built beside the old
+     * one, forced whole, and only then moved over it in a single step, so a failure at any
+     * point leaves the file that was already there.
+     *
+     * @return the number of keys the rewritten file describes
+     */
+    public int rewrite() {
+        if (channel == null) {
+            throw new IllegalStateException("no append only file to rewrite");
+        }
+        lock.lock();
+        try {
+            if (channel == null) {
+                throw new IllegalStateException("no append only file to rewrite");
+            }
+            Path target = new File(redisConfig.getAppendfilename()).toPath();
+            Path temp = target.resolveSibling(target.getFileName().toString() + ".rewrite");
+
+            int keys;
+            try {
+                keys = writeSnapshot(temp);
+            } catch (IOException failure) {
+                throw new UncheckedIOException("could not write the rewritten append only file",
+                        deleteQuietly(temp, failure));
+            }
+
+            FileChannel previous = channel;
+            try {
+                // the old handle has to go first: the file cannot be moved away while it is
+                // still open, and the lock keeps every appender waiting in that gap
+                previous.close();
+                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException failure) {
+                // the move did not happen, so the file that was there is still there: open
+                // it again so later writes keep working instead of hitting a closed channel
+                reopenQuietly(target, failure);
+                throw new UncheckedIOException("could not replace the append only file",
+                        deleteQuietly(temp, failure));
+            }
+
+            FileChannel rewritten;
+            try {
+                rewritten = FileChannel.open(target, StandardOpenOption.CREATE,
+                        StandardOpenOption.READ, StandardOpenOption.WRITE);
+                rewritten.position(rewritten.size());
+            } catch (IOException failure) {
+                throw new UncheckedIOException("the rewritten file could not be reopened", failure);
+            }
+            channel = rewritten;
+            logger.info("appendonly rewrote " + redisConfig.getAppendfilename()
+                    + " down to " + keys + " keys");
+            return keys;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Writes the live keys to a fresh file, whole and forced, before it is put in place. */
+    private int writeSnapshot(Path temp) throws IOException {
+        List<String[]> snapshot = snapshot();
+        try (FileChannel out = FileChannel.open(temp, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            for (String[] frame : snapshot) {
+                out.write(ByteBuffer.wrap(
+                        respSerializer.respArray(frame).getBytes(StandardCharsets.UTF_8)));
+            }
+            // the bytes have to be on disk before the move announces them: a rename says
+            // nothing about what is behind it, so the temp file is forced whatever the
+            // policy is. The policy still governs the appends that come after the swap.
+            out.force(true);
+        }
+        return snapshot.size();
+    }
+
+    /**
+     * The store as entries that say the same thing on replay: one SET per live key, carrying
+     * the absolute deadline the key already has. A key whose deadline has passed is left out,
+     * because it is not part of the state any more.
+     */
+    private List<String[]> snapshot() {
+        List<String[]> snapshot = new ArrayList<>();
+        LocalDateTime now = LocalDateTime.now();
+        for (String key : new ArrayList<>(store.map.keySet())) {
+            Value value = store.peekValue(key);
+            if (value == null || value.expiry.isBefore(now)) {
+                continue;
+            }
+            Long deadline = absoluteExpiryMillis(value);
+            if (deadline == null) {
+                snapshot.add(new String[]{"SET", key, value.val});
+            } else {
+                snapshot.add(new String[]{"SET", key, value.val, "PXAT", String.valueOf(deadline)});
+            }
+        }
+        return snapshot;
+    }
+
+    /** Deletes the temp file a failed rewrite left behind, keeping the original failure. */
+    private IOException deleteQuietly(Path temp, IOException failure) {
+        try {
+            Files.deleteIfExists(temp);
+        } catch (IOException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+        }
+        return failure;
+    }
+
+    /** Reopens the file that was already there, remembering if that fails too. */
+    private void reopenQuietly(Path target, IOException failure) {
+        try {
+            FileChannel reopened = FileChannel.open(target, StandardOpenOption.CREATE,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
+            reopened.position(reopened.size());
+            channel = reopened;
+        } catch (IOException reopenFailure) {
+            failure.addSuppressed(reopenFailure);
         }
     }
 

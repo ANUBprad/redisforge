@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,10 +38,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Every test drives real sockets, and every wait is bounded, so a replica that quietly
  * stops following shows up as a failure rather than as a hang.</p>
  *
- * <p>A reconnect here is a fresh handshake followed by a fresh stream, and this PSYNC ships
- * an empty RDB, so a write the master accepted while the replica was away is not
- * backfilled. What has to hold is the other half: the replica finds the master again by
- * itself, and everything the master accepts after that arrives exactly once.</p>
+ * <p>A reconnect here is a fresh handshake, and then one of two things: a master that still
+ * holds the bytes the replica missed answers with a resume, and the replica carries on from
+ * where it stopped with those bytes written ahead of it; a master that cannot - because it
+ * restarted, or the position fell out of what it keeps - hands over a full resync and an
+ * empty RDB, which backfills nothing. The tests below cover both halves: the writes a
+ * resumed link backfills, and the writes a replaced stream leaves alone.</p>
  */
 class ReplicaRecoveryTest {
 
@@ -210,8 +213,9 @@ class ReplicaRecoveryTest {
                 "the replica did not report the offset its master counted for the write it applied");
 
         // the link goes away. The master keeps serving, so it streams past where the replica
-        // stands: nothing backfills the gap, but the position both name afterwards must
-        // still be the same one
+        // stands: what it keeps of the stream is what the replica can be resumed from, and
+        // whether it is resumed or handed over whole, the position both name afterwards has
+        // to be the same one
         closeUpstream(master);
         awaitAttached(master, 0);
         set(master.port, "recover:offset", "written while the replica was away");
@@ -220,9 +224,9 @@ class ReplicaRecoveryTest {
         set(master.port, "recover:offset", "after the link came back");
         awaitValue(replica, "recover:offset", "after the link came back");
 
-        // a full resync starts the replica from the position the master says the stream is
-        // at, and every write after that moves both by the same bytes, so a reconnect
-        // cannot leave them naming two different positions
+        // a write that follows moves both sides by the same bytes, whether the replica
+        // carried its stream on or took a new position, so a reconnect cannot leave them
+        // naming two different positions
         await(() -> {
             long masterOffset = offsetOrMinusOne(master.port);
             long replicaOffset = offsetOrMinusOne(replica.port);
@@ -274,6 +278,223 @@ class ReplicaRecoveryTest {
                 }, "the replica below was still held on a stream that no longer exists");
                 assertEquals(0, replica.slaveCount(),
                         "the connection that was let go of is still held as a replica");
+            }
+        }
+    }
+
+    /**
+     * The other half of a reconnect: a master that still holds what a replica missed carries
+     * that replica on from its own position instead of handing over the dataset again. The
+     * test plays the replica itself, so the link can be dropped at a chosen point and the
+     * bytes that come back are read exactly as a replica would read them.
+     */
+    @Test
+    void aLinkThatComesBackIsCarriedOnFromWhereItStopped() throws Exception {
+        int masterPort = freePort();
+        Node master = startMaster(masterPort);
+        master.awaitPortOpen();
+        int listeningPort = freePort();
+
+        try (RespSocket replica = new RespSocket(masterPort)) {
+            String[] resync = syncWholeStream(replica, listeningPort);
+            String replid = resync[1];
+            long position = Long.parseLong(resync[2]);
+            await(() -> master.readySlaveCount() == 1, "the replica never became ready to be sent writes");
+
+            // a write the replica reads off the socket, so its own position after it is known
+            set(master.port, "resume:before", "read while the link was up");
+            byte[] before = frame("SET", "resume:before", "read while the link was up");
+            assertArrayEquals(before, replica.readBytes(before.length),
+                    "a write does not travel as the bytes it was made of");
+            position += before.length;
+            assertEquals(position, reportedOffset(master.port),
+                    "the replica's own position is not the one its master counts for the same write");
+
+            // the link goes away, and a write is accepted while the replica is not there
+            replica.close();
+            await(() -> master.readySlaveCount() == 0, "the master still held the replica that hung up");
+            byte[] missed = frame("SET", "resume:gap", "written while the link was down");
+            set(master.port, "resume:gap", "written while the link was down");
+            assertEquals(position + missed.length, reportedOffset(master.port),
+                    "the write made during the gap was not counted at its own length");
+
+            try (RespSocket resumed = new RespSocket(masterPort)) {
+                greet(resumed, listeningPort);
+                resumed.send(frame("PSYNC", replid, Long.toString(position)));
+                assertEquals("+CONTINUE " + replid, resumed.readLine(),
+                        "the master replaced the stream instead of carrying this replica's own on");
+
+                // what was missed arrives before anything that followed it, and whole
+                assertArrayEquals(missed, resumed.readBytes(missed.length),
+                        "the bytes written while the replica was away did not come back whole");
+
+                // and the stream carries on from there rather than starting again
+                byte[] after = frame("SET", "resume:after", "after the resume");
+                set(master.port, "resume:after", "after the resume");
+                assertArrayEquals(after, resumed.readBytes(after.length),
+                        "the stream did not continue from the position it resumed at");
+                assertEquals(1, master.slaveCount(),
+                        "the resumed replica holds more than one connection to its master");
+            }
+        }
+    }
+
+    /**
+     * The window is only so wide, so a replica that was away for longer than that cannot be
+     * carried on: its position has already fallen out, and the answer is the whole stream
+     * from the position the master has reached. What must not happen is the middle way -
+     * a resume from a position whose bytes are gone, which would silently skip a write.
+     */
+    @Test
+    void aPositionTheMasterHasAlreadyLetGoOfIsAnsweredWithTheWholeStream() throws Exception {
+        int masterPort = freePort();
+        Node master = startMaster(masterPort, 64);
+        master.awaitPortOpen();
+        int listeningPort = freePort();
+
+        try (RespSocket replica = new RespSocket(masterPort)) {
+            String[] resync = syncWholeStream(replica, listeningPort);
+            String replid = resync[1];
+            long position = Long.parseLong(resync[2]);
+            await(() -> master.readySlaveCount() == 1, "the replica never became ready to be sent writes");
+
+            set(master.port, "evict:before", "before");
+            byte[] before = frame("SET", "evict:before", "before");
+            assertArrayEquals(before, replica.readBytes(before.length),
+                    "a write does not travel as the bytes it was made of");
+            position += before.length;
+            assertTrue(position < 64, "the test's own write does not fit in the window it set out to fill");
+
+            replica.close();
+            await(() -> master.readySlaveCount() == 0, "the master still held the replica that hung up");
+
+            // one write, larger than the whole window: what the replica needs is gone now
+            String gapValue = "the window is only sixty four bytes wide ".repeat(12);
+            byte[] gap = frame("SET", "evict:gap", gapValue);
+            assertTrue(gap.length > 64, "the write that is meant to fill the window does not");
+            set(master.port, "evict:gap", gapValue);
+            assertTrue(reportedOffset(master.port) > position + 64,
+                    "the window should have slid past the replica's position by now");
+
+            try (RespSocket resumed = new RespSocket(masterPort)) {
+                greet(resumed, listeningPort);
+                resumed.send(frame("PSYNC", replid, Long.toString(position)));
+                String answer = resumed.readLine();
+                assertTrue(answer.startsWith("+FULLRESYNC "), "the master resumed from a position it has let go of: " + answer);
+                assertEquals("+FULLRESYNC " + replid + " " + reportedOffset(master.port), answer,
+                        "the replica was not moved to the position the stream has reached");
+                String header = resumed.readLine();
+                assertTrue(header.startsWith("$"), "the dataset was not introduced by its length: " + header);
+                resumed.readBytes(Integer.parseInt(header.substring(1)));
+
+                // no backfill: the first thing after the dataset is the next write, and the
+                // one that fell out of the window is never sent again
+                byte[] after = frame("SET", "evict:after", "after the whole stream came again");
+                set(master.port, "evict:after", "after the whole stream came again");
+                assertArrayEquals(after, resumed.readBytes(after.length),
+                        "what followed the dataset was not the very next write");
+                assertEquals(1, master.slaveCount(),
+                        "the replica holds more than one connection to its master");
+            }
+        }
+    }
+
+    /**
+     * A resume carries raw bytes, so a write that is large and not made of ASCII has to come
+     * back through the window without a byte of it changing.
+     */
+    @Test
+    void aMissedFrameComesBackByteForByteEvenWhenItIsLargeAndNotAscii() throws Exception {
+        int masterPort = freePort();
+        Node master = startMaster(masterPort);
+        master.awaitPortOpen();
+        int listeningPort = freePort();
+
+        try (RespSocket replica = new RespSocket(masterPort)) {
+            String[] resync = syncWholeStream(replica, listeningPort);
+            String replid = resync[1];
+            long position = Long.parseLong(resync[2]);
+            await(() -> master.readySlaveCount() == 1, "the replica never became ready to be sent writes");
+
+            replica.close();
+            await(() -> master.readySlaveCount() == 0, "the master still held the replica that hung up");
+
+            String value = "\u0939\u093F\u0928\u094D\u0926\u0940 \uD83C\uDF0D h\u00E9llo ".repeat(4_000);
+            byte[] missed = frame("SET", "resume:large", value);
+            assertTrue(missed.length > 100_000, "the test's own write is not large: " + missed.length);
+            set(master.port, "resume:large", value);
+
+            try (RespSocket resumed = new RespSocket(masterPort)) {
+                greet(resumed, listeningPort);
+                resumed.send(frame("PSYNC", replid, Long.toString(position)));
+                assertEquals("+CONTINUE " + replid, resumed.readLine(),
+                        "the master replaced the stream instead of carrying this replica's own on");
+                assertArrayEquals(missed, resumed.readBytes(missed.length),
+                        "a large multibyte frame did not come back through the window byte for byte");
+
+                byte[] after = frame("SET", "resume:after", "after the large one");
+                set(master.port, "resume:after", "after the large one");
+                assertArrayEquals(after, resumed.readBytes(after.length),
+                        "the stream did not continue after the frame it carried");
+            }
+        }
+    }
+
+    /**
+     * A chain holds three positions: the master's, the middle hop's, and the one below. When
+     * the middle hop's link comes back, its own stream is carried on - which means nothing
+     * below it is let go of, and the write it missed is passed straight down.
+     */
+    @Test
+    void aChainKeepsTheReplicaBelowWhenItsUpperHopIsResumedInsteadOfReplaced() throws Exception {
+        int masterPort = freePort();
+        Node replica = startReplica(freePort(), masterPort);
+        replica.awaitPortOpen();
+
+        try (ScriptedMaster scripted = new ScriptedMaster(masterPort, replica.port)) {
+            scripted.attach();
+            scripted.handshake();
+            scripted.stream(frame("INCR", "resumed:counter"));
+            awaitValue(replica, "resumed:counter", "1");
+            byte[] firstWrite = frame("INCR", "resumed:counter");
+
+            // a replica below attaches to this hop, and is given the stream from where it stands
+            try (RespSocket below = new RespSocket(replica.port)) {
+                below.send(frame("REPLCONF", "listening-port", "" + freePort()));
+                assertEquals("+OK", below.readReply(), "the replica below was refused");
+                await(() -> replica.slaveCount() == 1, "the replica below never registered");
+                below.send(frame("PSYNC", "?", "-1"));
+                String status = below.readLine();
+                assertTrue(status.startsWith("+FULLRESYNC "), "the replica below was not given the stream: " + status);
+                String header = below.readLine();
+                assertTrue(header.startsWith("$"), "the dataset was not introduced by its length: " + header);
+                below.readBytes(Integer.parseInt(header.substring(1)));
+                await(() -> replica.readySlaveCount() == 1,
+                        "the replica below was never made ready to be sent writes");
+
+                // the master hangs up. When this hop asks to carry on, it is given the write
+                // it missed instead of a stream that starts somewhere else
+                scripted.hangUp();
+                scripted.attach();
+                long askedFor = scripted.handshakeResume(firstWrite);
+                assertEquals(firstWrite.length, askedFor,
+                        "the upper hop asked to resume from a position its own stream never stood at");
+
+                // the write is applied once here and passed straight down to the replica
+                // below, which is still attached to the same stream it was before
+                awaitValue(replica, "resumed:counter", "2");
+                assertArrayEquals(firstWrite, below.readBytes(firstWrite.length),
+                        "the write carried with the resume did not reach the replica below");
+                assertEquals(1, replica.slaveCount(),
+                        "the replica below was let go of when its upper hop resumed instead of restarting");
+
+                // and the stream goes on from there for both of them
+                scripted.stream(frame("INCR", "resumed:counter"));
+                awaitValue(replica, "resumed:counter", "3");
+                assertArrayEquals(firstWrite, below.readBytes(firstWrite.length),
+                        "the stream did not carry on below after the resume");
+                assertEquals(1, replica.slaveCount(),
+                        "the replica below attached again after its upper hop resumed");
             }
         }
     }
@@ -331,11 +552,22 @@ class ReplicaRecoveryTest {
     // ---------------------------------------------------------------- nodes
 
     private Node startMaster(int port) {
+        return startMaster(port, 0);
+    }
+
+    /**
+     * A master whose replication window is only {@code backlogSize} bytes wide when a test
+     * gives it one, which is how a position falls out of what a master keeps.
+     */
+    private Node startMaster(int port, int backlogSize) {
         AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext(AppConfig.class);
         RedisConfig config = context.getBean(RedisConfig.class);
         config.setRole("master");
         config.setPort(port);
         config.setAppendonly(false);
+        if (backlogSize > 0) {
+            config.setReplBacklogSize(backlogSize);
+        }
         Node node = new Node(context, port, null);
         nodes.add(node);
         node.startAcceptLoop();
@@ -497,6 +729,31 @@ class ReplicaRecoveryTest {
         }
 
         private void handshake() throws IOException {
+            requestHandshake();
+            String[] psync = request();
+            assertEquals("PSYNC", psync[0], "the attachment did not ask for the command stream");
+            if (psync[1].equals("?")) {
+                assertEquals("-1", psync[2],
+                        "a replica with no stream did not ask for the whole thing");
+            } else {
+                // a replica that already follows a stream asks to carry it on from its own
+                // position. This scripted master keeps nothing, so it has no bytes to carry
+                // on with and hands over a full resync instead - which is the fallback every
+                // real master has for a position it cannot resume from
+                assertTrue(Long.parseLong(psync[2]) >= 0,
+                        "a replica asked to resume from a position before its own stream: " + psync[2]);
+            }
+            // the offset is the position in the write stream, as our own master and real Redis
+            // both send it: a plain number the replica can pick its own stream up from
+            write("+FULLRESYNC scriptedreplid 0");
+            byte[] rdb = java.util.Base64.getDecoder().decode(EMPTY_RDB_BASE64);
+            write("$" + rdb.length);
+            out.write(rdb);
+            out.flush();
+        }
+
+        /** The steps every attachment makes before it asks for the command stream. */
+        private void requestHandshake() throws IOException {
             assertArrayEquals(new String[]{"PING"}, request(), "the attachment did not start with a ping");
             write("+PONG");
             assertArrayEquals(new String[]{"REPLCONF", "listening-port", "" + replicaPort}, request(),
@@ -505,15 +762,33 @@ class ReplicaRecoveryTest {
             assertArrayEquals(new String[]{"REPLCONF", "capa", "psync2"}, request(),
                     "the attachment did not carry the capability handshake");
             write("+OK");
-            assertArrayEquals(new String[]{"PSYNC", "?", "-1"}, request(),
-                    "the attachment did not ask for a full resync");
-            // the offset is the position in the write stream, as our own master and real Redis
-            // both send it: a plain number the replica can pick its own stream up from
-            write("+FULLRESYNC scriptedreplid 0");
-            byte[] rdb = java.util.Base64.getDecoder().decode(EMPTY_RDB_BASE64);
-            write("$" + rdb.length);
-            out.write(rdb);
-            out.flush();
+        }
+
+        /**
+         * The second answer: a replica that already follows this stream is carried on from
+         * its own position, with the bytes it missed written out behind the answer. No
+         * dataset follows, and no position is taken over - the writes that come next are the
+         * ones that come after the replica stopped.
+         *
+         * @param missed the bytes to write between the answer and the stream that follows
+         * @return the position the replica asked to be carried on from
+         */
+        private long handshakeResume(byte[] missed) throws IOException {
+            requestHandshake();
+            String[] psync = request();
+            assertEquals("PSYNC", psync[0], "the attachment did not ask for the command stream");
+            assertFalse(psync[1].equals("?"),
+                    "a replica that already follows a stream asked for the whole thing");
+            assertEquals("scriptedreplid", psync[1],
+                    "a replica asked to carry on a stream this master does not hold");
+            long position = Long.parseLong(psync[2]);
+            assertTrue(position >= 0, "a replica asked to resume from before its own stream: " + psync[2]);
+            write("+CONTINUE scriptedreplid");
+            if (missed.length > 0) {
+                out.write(missed);
+                out.flush();
+            }
+            return position;
         }
 
         private void stream(byte[]... commands) throws IOException {
@@ -562,6 +837,40 @@ class ReplicaRecoveryTest {
     }
 
     // ------------------------------------------------------------- actions
+
+    /**
+     * The start of a replica's handshake against a real master: its listening port, which is
+     * how it is known again on the next attachment, and its capabilities. Everything up to
+     * but not including PSYNC, so a test can ask for the whole stream or for its own.
+     */
+    private static void greet(RespSocket replica, int listeningPort) throws IOException {
+        replica.send(frame("PING"));
+        assertEquals("+PONG", replica.readReply(), "the master did not answer the handshake ping");
+        replica.send(frame("REPLCONF", "listening-port", "" + listeningPort));
+        assertEquals("+OK", replica.readReply(), "the master refused the replica's listening port");
+        replica.send(frame("REPLCONF", "capa", "psync2"));
+        assertEquals("+OK", replica.readReply(), "the master refused the replica's capabilities");
+    }
+
+    /**
+     * A replica attaching for the first time: the handshake, a request for the whole stream,
+     * and the dataset behind it read off so the socket is left at the first write.
+     *
+     * @return the parts of the resync line, which are the stream's id and the position the
+     *         replica takes on with it
+     */
+    private static String[] syncWholeStream(RespSocket replica, int listeningPort) throws IOException {
+        greet(replica, listeningPort);
+        replica.send(frame("PSYNC", "?", "-1"));
+        String status = replica.readLine();
+        assertTrue(status.startsWith("+FULLRESYNC "), "the master did not hand over the stream: " + status);
+        String[] parts = status.split(" ");
+        assertEquals(3, parts.length, "the resync line did not name a stream and a position: " + status);
+        String header = replica.readLine();
+        assertTrue(header.startsWith("$"), "the dataset was not introduced by its length: " + header);
+        replica.readBytes(Integer.parseInt(header.substring(1)));
+        return parts;
+    }
 
     /** The offset a node reports, or -1 when it could not be asked, for use inside a wait. */
     private static long offsetOrMinusOne(int port) {
@@ -671,10 +980,6 @@ class ReplicaRecoveryTest {
         }
     }
 
-    private static void assertArrayEquals(String[] expected, String[] actual, String message) {
-        org.junit.jupiter.api.Assertions.assertArrayEquals(expected, actual, message);
-    }
-
     // ------------------------------------------------------------- waiting
 
     private static void await(BooleanSupplier condition, String message) {
@@ -775,6 +1080,20 @@ class ReplicaRecoveryTest {
             readByte();
             readByte();
             return value.toString();
+        }
+
+        /** Reads exactly the given number of raw bytes, so what arrived can be compared as bytes. */
+        private byte[] readBytes(int length) throws IOException {
+            byte[] bytes = new byte[length];
+            int read = 0;
+            while (read < length) {
+                int count = in.read(bytes, read, length - read);
+                if (count == -1) {
+                    throw new IOException("the server hung up after " + read + " of " + length + " bytes");
+                }
+                read += count;
+            }
+            return bytes;
         }
 
         private String readLine() throws IOException {

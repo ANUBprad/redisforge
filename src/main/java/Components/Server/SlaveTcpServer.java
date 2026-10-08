@@ -15,7 +15,6 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -178,9 +177,11 @@ public class SlaveTcpServer {
             outputStream.write(replconf.getBytes());
             logger.log(Level.FINE, readLine(inputStream));
 
-            // part 3 of the handshake
-            outputStream.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".getBytes());
-            readFullResync(inputStream);
+            // part 3 of the handshake. A replica that has never had a stream asks for the
+            // whole thing; one that has asks to carry its own on from where it stands, which
+            // is answered with the bytes it missed instead of the dataset it already holds
+            outputStream.write(psyncRequest());
+            readPsyncReply(inputStream);
 
             streamFromMaster(new Client(master, inputStream, outputStream, -1));
             // the master hung up, which is not a failure: the loop looks for it again
@@ -189,6 +190,22 @@ public class SlaveTcpServer {
             masterConnection = null;
             closeQuietly(master);
         }
+    }
+
+    /**
+     * What this replica asks for when it attaches: the whole stream if it has never had
+     * one, and its own position in the stream it already follows if it has. The position is
+     * the offset it counted for the writes it applied, so the master can hand back exactly
+     * the bytes that stand between them - which is only ever a whole number of frames, since
+     * a frame is the unit the offset is counted in.
+     */
+    private byte[] psyncRequest() {
+        if (!redisConfig.hasAdoptedStream()) {
+            return "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".getBytes(StandardCharsets.UTF_8);
+        }
+        String[] psync = new String[]{"PSYNC", redisConfig.getMasterReplId(),
+                String.valueOf(redisConfig.getMasterReplOffset())};
+        return respSerializer.respArray(psync).getBytes(StandardCharsets.UTF_8);
     }
 
     /**
@@ -249,39 +266,84 @@ public class SlaveTcpServer {
                 String response = handleCommandFromMaster(command, master);
                 if(response != null && !response.isEmpty())
                     master.outputStream.write(response.getBytes());
-                if(!isReplicationControlCommand(command[0])){
-                    // the offset follows the write stream only, because that is what the
-                    // sending side counted; a control frame is not part of it, so an ACK
-                    // from here compares equal against the master's own count. It counts
-                    // the bytes the command travels as, in the same encoding, so the two
-                    // sides of a hop can never disagree about how far the other has got
-                    redisConfig.recordReplicatedBytes(replicatedBytes(command).length);
-                }
+                // what a write is counted in is decided by propagate: a write is counted
+                // and passed on as one step, and a control frame such as an answer to
+                // GETACK never reaches it, so the offset goes on counting the write stream
+                // only - in the same bytes both sides of a hop travel in, so an ACK from
+                // here compares equal against the master's own count
             }
         }
     }
 
     /**
-     * Consumes the answer to PSYNC: the "+FULLRESYNC" status line, the header of the RDB
-     * bulk string behind it, and exactly as many payload bytes as that header declares.
-     * This master sends no CRLF after the payload, so the first replicated command picks
-     * up on the very next byte.
+     * Consumes the answer to PSYNC, which is one of two things.
+     *
+     * <p>A "+CONTINUE" means the master still holds this replica's stream: no dataset
+     * arrives, no position is taken over, nothing below is let go of, and the writes that
+     * follow pick up exactly where this replica stopped, because the bytes in between were
+     * written with the answer. Anything else is a "+FULLRESYNC" and the RDB behind it, which
+     * is where a new position is taken.</p>
      */
-    private void readFullResync(InputStream inputStream) throws IOException {
+    private void readPsyncReply(InputStream inputStream) throws IOException {
         String status = readLine(inputStream);
-        if(status == null || !status.startsWith("+FULLRESYNC")){
-            throw new IOException("expected +FULLRESYNC from the master but read: " + status);
+        if(status == null){
+            throw new IOException("the master hung up before answering PSYNC");
+        }
+        if(status.startsWith("+CONTINUE")){
+            logger.log(Level.FINE, status);
+            String[] continueReply = status.split(" ");
+            if(continueReply.length >= 2 && !continueReply[1].equals(redisConfig.getMasterReplId())){
+                // a master carrying on a stream this replica does not follow would leave the
+                // two naming different streams under one id, so this is treated as a failed
+                // attempt and the next one starts again from a new socket
+                throw new IOException("+CONTINUE for a replication id this replica does not follow: " + status);
+            }
+            return;
+        }
+        if(!status.startsWith("+FULLRESYNC")){
+            throw new IOException("expected +FULLRESYNC or +CONTINUE from the master but read: " + status);
         }
         logger.log(Level.FINE, status);
 
-        // take the master's offset as the position this hop starts from. Everything the
-        // master has streamed so far, including what this replica missed while it was away,
-        // is behind that number, so this is where its own stream now stands
         String[] fullResync = status.split(" ");
         if(fullResync.length < 3){
             throw new IOException("+FULLRESYNC without a replication id and offset: " + status);
         }
-        long adopted = Long.parseLong(fullResync[2]);
+        long adopted;
+        try {
+            adopted = Long.parseLong(fullResync[2]);
+        } catch (NumberFormatException notAPosition) {
+            // a line this replica cannot place itself by is not a stream it can follow, and
+            // letting the parse escape would kill the one thread that looks for the master
+            throw new IOException("+FULLRESYNC with a position that is not a number: " + status);
+        }
+
+        String header = readLine(inputStream);
+        if(header == null || !header.startsWith("$")){
+            throw new IOException("expected the length of the RDB but read: " + header);
+        }
+        int rdbLength;
+        try {
+            rdbLength = Integer.parseInt(header.substring(1));
+        } catch (NumberFormatException notALength) {
+            throw new IOException("the dataset did not declare a length: " + header);
+        }
+
+        // the RDB is raw bytes, so it is counted off rather than scanned for a delimiter.
+        // This master sends no CRLF after the payload, so the first replicated command
+        // picks up on the very next byte
+        byte[] rdb = inputStream.readNBytes(rdbLength);
+        if(rdb.length != rdbLength){
+            throw new EOFException("the RDB ended after " + rdb.length + " of " + rdbLength + " bytes");
+        }
+
+        // the position is taken only once the dataset behind it has arrived whole: half a
+        // resync is not a stream this replica can resume from later, and taking the
+        // position anyway would have it asking the master to carry on a dataset it never
+        // received. Everything the master has streamed so far, including what this replica
+        // missed while it was away, is behind that number, so this is where its own stream
+        // now stands - and the backlog is emptied onto it, because what it held belongs to
+        // the position this hop has just left
         if(adopted != redisConfig.getMasterReplOffset()){
             // a position that moved means a new stream, not a resumed one: a master that
             // restarted counts from nothing again, and what was streamed here while this
@@ -292,18 +354,7 @@ public class SlaveTcpServer {
         }
         redisConfig.setMasterReplId(fullResync[1]);
         redisConfig.setMasterReplOffset(adopted);
-
-        String header = readLine(inputStream);
-        if(header == null || !header.startsWith("$")){
-            throw new IOException("expected the length of the RDB but read: " + header);
-        }
-        int rdbLength = Integer.parseInt(header.substring(1));
-
-        // the RDB is raw bytes, so it is counted off rather than scanned for a delimiter
-        byte[] rdb = inputStream.readNBytes(rdbLength);
-        if(rdb.length != rdbLength){
-            throw new EOFException("the RDB ended after " + rdb.length + " of " + rdbLength + " bytes");
-        }
+        redisConfig.markAdoptedStream();
     }
 
     /** Reads one CRLF terminated line, or null once the master has hung up. */
@@ -322,16 +373,7 @@ public class SlaveTcpServer {
         return line.length() == 0 ? null : line.toString();
     }
 
-    /** Replication plumbing: consumed on the way in, never applied and never counted. */
-    private boolean isReplicationControlCommand(String command) {
-        return command.equalsIgnoreCase("REPLCONF");
-    }
-
     private String handleCommandFromMaster(String[] command, Client master) {
-        System.out.println("================================= received command from master =================================");
-        for(String c: command){
-            System.out.print(c+" ");
-        }
         String cmd = command[0];
         cmd = cmd.toUpperCase();
 
@@ -400,25 +442,26 @@ public class SlaveTcpServer {
     private void propagate(String[] command) {
         // a copy, because a replica that cannot be written to is dropped on the way past
         byte[] propagated = replicatedBytes(command);
-        for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
-            if(!slave.isReady()){
-                // registered by a downstream replica, but still handshaking: a write now
-                // would be read by one that is waiting for its FULLRESYNC, so it waits too
-                logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
-                continue;
-            }
-            System.out.println("========================= sending command down to slave ==============================");
-            System.out.println("command: "+new String(propagated, StandardCharsets.UTF_8));
-            System.out.println(slave.connection.id);
-            InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-            System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
-            try {
-                slave.send(propagated);
-            } catch (IOException e) {
-                // propagation runs on the upstream loop's thread, so a downstream replica
-                // that stops reading must not be allowed to break that loop
-                logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
-                connectionPool.removeSlave(slave);
+        // one hold of the backlog's lock: what this hop counts, what it keeps for a replica
+        // to resume from and what it sends are one step, so a replica below can never be
+        // offered a position whose bytes were counted here but not yet passed on
+        synchronized (redisConfig.getReplicationBacklog()) {
+            redisConfig.recordReplicatedBytes(propagated);
+            for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+                if(!slave.isReady()){
+                    // registered by a downstream replica, but still handshaking: a write now
+                    // would be read by one that is waiting for its answer to PSYNC, so it waits too
+                    logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
+                    continue;
+                }
+                try {
+                    slave.send(propagated);
+                } catch (IOException e) {
+                    // propagation runs on the upstream loop's thread, so a downstream replica
+                    // that stops reading must not be allowed to break that loop
+                    logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
+                    connectionPool.removeSlave(slave);
+                }
             }
         }
     }
@@ -469,7 +512,12 @@ public class SlaveTcpServer {
                 res = commandHandler.info(command);
                 break;
             case "PSYNC":
+                // both answers are written by the handler itself while the backlog is held,
+                // so null means the socket already has its reply
                 ResponseDto resDto = commandHandler.psync(command, client);
+                if(resDto == null){
+                    return;
+                }
                 res = resDto.response;
                 data = resDto.data;
                 break;

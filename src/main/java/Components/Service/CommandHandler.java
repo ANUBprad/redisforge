@@ -2,6 +2,7 @@ package Components.Service;
 
 import Components.Infra.Client;
 import Components.Infra.ConnectionPool;
+import Components.Infra.ReplicationBacklog;
 import Components.Infra.Slave;
 import Components.Repository.Store;
 import Components.Repository.Value;
@@ -141,11 +142,80 @@ public class CommandHandler {
         System.arraycopy(b, 0, result, a.length, b.length);
         return result;
     }
-    public ResponseDto psync(String[] command, Client client) {
+    /**
+     * Answers a replica's request for the command stream.
+     *
+     * <p>There are two answers. A replica that names this master's replication id and a
+     * position the backlog still holds is told to carry on from there, and the bytes it
+     * missed are written out with the answer. Anything else - a replica that has never
+     * synced, a replication id this master does not have, a position ahead of the stream or
+     * one that has already fallen out of the backlog, or a position that does not parse -
+     * is answered with a full resync, which is always safe because the replica adopts
+     * whatever position this master's stream has reached.</p>
+     *
+     * <p>Both answers are written from inside this method, with the backlog's lock held, and
+     * the whole answer - the position it names, the bytes behind it and the moment the
+     * replica becomes eligible for writes - is one step. Handing the reply back to the
+     * caller would open a gap between them: a write made in that gap would be counted after
+     * a position that does not include it, or reach a replica before the answer that tells
+     * it where it stands. Holding the lock across the whole thing is also what makes the
+     * answer indivisible against propagation, which counts and sends under the same lock.</p>
+     *
+     * @return the reply to write, or null when this method has already written it
+     */
+    public ResponseDto psync(String[] command, Client client) throws IOException {
+        if (command.length < 3) {
+            return new ResponseDto("-ERR wrong number of arguments for 'psync' command\r\n");
+        }
         String replicationIdMaster = command[1];
         String replicationOffSetMaster = command[2];
 
-        if(replicationIdMaster.equals("?") && replicationOffSetMaster.equals("-1")){
+        if (replicationIdMaster.equals("?")) {
+            // a replica with no stream of its own, whatever it says about a position
+            fullResync(client);
+            return null;
+        }
+
+        long requested;
+        try {
+            requested = Long.parseLong(replicationOffSetMaster);
+        } catch (NumberFormatException notAPosition) {
+            fullResync(client);
+            return null;
+        }
+
+        ReplicationBacklog backlog = redisConfig.getReplicationBacklog();
+        synchronized (backlog) {
+            if (requested >= 0
+                    && requested <= redisConfig.getMasterReplOffset()
+                    && backlog.covers(requested)
+                    && replicationIdMaster.equals(redisConfig.getMasterReplId())) {
+                byte[] missed = backlog.read(requested);
+                // PSYNC is control traffic: it says a replica has attached or asked to carry
+                // on, not that it has consumed a write, so it must not count towards a WAIT
+                startStream(client);
+                client.send("+CONTINUE " + replicationIdMaster + "\r\n", missed);
+                return null;
+            }
+            // the position was refused on facts checked under this same hold of the lock, so
+            // the whole stream is handed over without a write getting between the decision
+            // and the answer to it
+            fullResync(client);
+            return null;
+        }
+    }
+
+    /**
+     * Hands over the whole stream from this position: a full resync line carrying the
+     * replication id and offset this replica should take on, and the dataset behind it.
+     *
+     * <p>Written to the socket before this returns, under the backlog's lock, for the same
+     * reason a resume is: the position, the dataset and the moment the replica becomes
+     * eligible for the writes that follow cannot be taken apart.</p>
+     */
+    private void fullResync(Client client) throws IOException {
+        ReplicationBacklog backlog = redisConfig.getReplicationBacklog();
+        synchronized (backlog) {
             String replicationId = redisConfig.getMasterReplId();
             long replicationOffset = redisConfig.getMasterReplOffset();
             String res = "+FULLRESYNC "+ replicationId +" "+replicationOffset+"\r\n";
@@ -157,24 +227,27 @@ public class CommandHandler {
             String fullResyncHeader = "$"+ length +"\r\n";
             byte[] header = fullResyncHeader.getBytes();
 
-            // PSYNC is control traffic: it says a replica has attached, not that it has
-            // consumed a write, so it must not count towards a WAIT
+            startStream(client);
 
-            // the replica's command stream starts here, and only from this point can it be
-            // sent writes. It registered itself earlier, when it gave its listening port, and
-            // anything sent before this would arrive in the middle of its handshake and take
-            // the whole stream out of step. A master and a replica that is itself a master to
-            // another replica both come through here, so neither can forget it
-            Slave slave = connectionPool.slaveFor(client);
-            if(slave != null){
-                slave.markReady();
-            }
-
-            return new ResponseDto(res, concatenate(header, rdbFileData));
-        }else{
-            return new ResponseDto("Options not supported yet.");
+            client.send(res, concatenate(header, rdbFileData));
         }
+    }
 
+    /**
+     * Opens a replica's command stream, which is the point from which it may be sent writes.
+     *
+     * <p>It registered itself earlier, when it gave its listening port, and anything sent
+     * before this would arrive in the middle of its handshake and take the whole stream out
+     * of step. A master and a replica that is itself a master to another replica both come
+     * through here, so neither can forget it. PSYNC is control traffic either way: it says
+     * a replica has attached, not that it has consumed a write, so it counts towards no WAIT
+     * and never moves the offset.</p>
+     */
+    private void startStream(Client client) {
+        Slave slave = connectionPool.slaveFor(client);
+        if(slave != null){
+            slave.markReady();
+        }
     }
     public String wait(String[] command, Instant start) {
         String[] getackarr = new String[] { "REPLCONF", "GETACK", "*" };

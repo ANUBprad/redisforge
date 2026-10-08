@@ -16,7 +16,6 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -114,7 +113,12 @@ public class MasterTcpServer {
     private void handleCommand(String[] command, Client client) throws IOException {
         if(!client.getTransactionalContext()){
             ResponseDto responseDto = caseHandler(command, client);
-            client.send(responseDto);
+            // null means the command answered the socket itself: PSYNC writes both of its
+            // answers while the backlog is held, and writing one anywhere else would let a
+            // write overtake it or land ahead of the bytes it follows
+            if(responseDto != null){
+                client.send(responseDto);
+            }
         }else if(!isTransactionalControlCommand(command[0])){
             // we are in the transactional context and the command is a normal command
             addCommandToTransaction(command, client);
@@ -150,11 +154,9 @@ public class MasterTcpServer {
 
                 client.endTransaction();
                 while(!commands.isEmpty()){
-                    String[] commandToPropagate = commands.poll();
-                    String commandRespString = respSerializer.respArray(commandToPropagate);
-                    byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
-                    redisConfig.recordReplicatedBytes(toCount.length);
-                    propagate(commandToPropagate);
+                    // each command is counted and sent as one step, so a replica that asks
+                    // to carry on between two of them is resumed at a whole frame
+                    propagate(commands.poll());
                 }
 
                 String response = respSerializer.respArray(client.transactionResponse);
@@ -202,7 +204,7 @@ public class MasterTcpServer {
         };
     }
 
-    public ResponseDto caseHandler(String[] command, Client client){
+    public ResponseDto caseHandler(String[] command, Client client) throws IOException {
         //control comes here only when the client is not in a transaction
         String res = "";
         byte[] data = null;
@@ -235,9 +237,6 @@ public class MasterTcpServer {
                         // written to the file nor replicated
                         if (!increment.startsWith("-")) {
                             appendOnlyPersistence.appendApplied(command);
-                            String incrToPropagate = respSerializer.respArray(command);
-                            redisConfig.recordReplicatedBytes(
-                                    incrToPropagate.getBytes(StandardCharsets.UTF_8).length);
                             propagate(command);
                         }
                         return increment;
@@ -258,9 +257,6 @@ public class MasterTcpServer {
                         // can be written with an absolute one
                         appendOnlyPersistence.appendApplied(command);
                     }
-                    String commandRespString = respSerializer.respArray(command);
-                    byte[] toCount = commandRespString.getBytes(StandardCharsets.UTF_8);
-                    redisConfig.recordReplicatedBytes(toCount.length);
                     // on this thread, so replicas receive writes in the order they arrived
                     propagate(command);
                     return set;
@@ -285,7 +281,12 @@ public class MasterTcpServer {
                 connectionPool.resetCaughtUpAccounting();
                 break;
             case "PSYNC":
+                // both answers are written by the handler itself while the backlog is held,
+                // so null means the socket already has its reply
                 ResponseDto resDto = commandHandler.psync(command, client);
+                if(resDto == null){
+                    return null;
+                }
                 res = resDto.response;
                 data = resDto.data;
                 break;
@@ -319,27 +320,28 @@ public class MasterTcpServer {
         String commandRespString = respSerializer.respArray(command);
         // the same bytes the replicas are sent, so the offset counts what went over the wire
         byte[] propagated = commandRespString.getBytes(StandardCharsets.UTF_8);
-        // a copy, because a replica that cannot be written to is dropped on the way past
-        for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
-            if(!slave.isReady()){
-                // registered, but still handshaking: a write now would be read by a replica
-                // that is waiting for its FULLRESYNC, so it is left until the stream starts
-                logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
-                continue;
-            }
-            System.out.println("========================= sending command down to slave ==============================");
-            System.out.println("command: "+commandRespString);
-            System.out.println(slave.connection.id);
-            InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-            System.out.println("Remote IP address: "+remoteAddress.getHostAddress()+":"+slave.connection.socket.getPort());
-
-            try {
-                slave.send(propagated);
-            } catch (IOException e) {
-                // propagation runs on the connection's thread, so a replica that stops
-                // reading must not be allowed to break that connection
-                logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
-                connectionPool.removeSlave(slave);
+        // one hold of the backlog's lock, because counting the bytes, keeping them and
+        // sending them is one step: a replica that asks to resume in between would
+        // otherwise be told a position whose bytes were counted but never sent, and would
+        // carry on from a stream with a hole in it
+        synchronized (redisConfig.getReplicationBacklog()) {
+            redisConfig.recordReplicatedBytes(propagated);
+            // a copy, because a replica that cannot be written to is dropped on the way past
+            for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
+                if(!slave.isReady()){
+                    // registered, but still handshaking: a write now would be read by a replica
+                    // that is waiting for its answer to PSYNC, so it is left until the stream starts
+                    logger.log(Level.FINE, "not sending to a replica whose stream has not started yet");
+                    continue;
+                }
+                try {
+                    slave.send(propagated);
+                } catch (IOException e) {
+                    // propagation runs on the connection's thread, so a replica that stops
+                    // reading must not be allowed to break that connection
+                    logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
+                    connectionPool.removeSlave(slave);
+                }
             }
         }
     }

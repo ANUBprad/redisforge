@@ -11,7 +11,7 @@ and asynchronous master/replica replication.
 - Transactions via `MULTI` / `EXEC` / `DISCARD`
 - Append-only file persistence on the master, replayed at startup, compacted on demand
   with `BGREWRITEAOF`
-- Replication: `REPLCONF`, `PSYNC` (full resync) and `WAIT`
+- Replication: `REPLCONF`, `PSYNC` (partial and full resync) and `WAIT`
 - Master and replica modes, with support for chained replication
 
 ## Requirements
@@ -49,6 +49,7 @@ Options:
 | `--appendonly yes\|no` | Persist writes to an append-only file and replay it on start | `no` |
 | `--appendfilename <path>` | Where the append-only file is kept | `appendonly.aof` |
 | `--appendfsync always\|everysec\|no` | How often the file is flushed to disk | `everysec` |
+| `--repl-backlog-size <bytes>` | How much of the replication stream a master keeps for partial resyncs | `1048576` |
 
 Start a replica:
 
@@ -149,14 +150,21 @@ with `-ERR no append only file to rewrite`, since a replica keeps no file of its
 ## Limitations
 
 - With `--appendonly no`, and always for a replica, data is held in memory only.
-  Replication still performs a full resync and ships an empty RDB payload, so a replica
-  restored that way starts empty until its master sends more.
+  The RDB shipped behind a full resync is empty, so a replica restored that way starts
+  empty until its master sends more.
 - There is no RDB snapshot: recovery always replays the append-only file.
   `BGREWRITEAOF` compacts it on demand, but nothing rewrites it in the background, so
   between rewrites the file holds the full history of the writes it replays.
-- Replication is full-resync only. There is no replication backlog and no partial
-  resync: a replica that reconnects, or one that attaches later, is always resynced
-  from scratch with an empty payload.
+- A replica reconnects with a partial resync when it can. A master keeps the newest
+  bytes of its stream in a backlog, sized with `--repl-backlog-size` (1 MiB by default),
+  and answers a replica that asks to carry on - naming the master's replication id and a
+  position the backlog still holds - with `+CONTINUE` and exactly the bytes it missed.
+  Anything else: a replica that has never synced, a replication id this master does not
+  have, a position ahead of the stream or one that has already fallen out of the backlog,
+  or a position that does not parse, is answered with a full resync, which is always safe
+  because the replica takes on whatever position the master's stream has reached. Since
+  the shipped RDB is empty, a full resync necessarily starts the replica from an empty
+  keyspace, and the stream that follows rebuilds it from the writes that come after.
 - No failover: a master that goes away is not replaced, and there is no Sentinel or
   Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.

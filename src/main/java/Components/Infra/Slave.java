@@ -61,7 +61,11 @@ public class Slave {
 
     public void send(byte[] bytes) throws IOException {
         if(bytes!=null){
-            this.connection.outputStream.write(bytes);
+            // through the connection's own synchronized write. This socket is written to by
+            // whichever thread is propagating and, at a resume, by the thread answering
+            // PSYNC, and two frames interleaved halfway would leave the replica reading a
+            // stream that is not made of frames at all
+            this.connection.send(bytes);
         }
     }
 }

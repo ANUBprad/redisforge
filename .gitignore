@@ -7,6 +7,7 @@ target/
 .project
 .settings/
 *.log
+*.bak
 .env
 *.pem
 *.key

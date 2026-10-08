@@ -46,6 +46,11 @@ public class Main {
                     // parsed here so a bad policy is refused before anything is opened
                     redisConfig.setAppendfsync(FsyncPolicy.parse(args[i+1]).name().toLowerCase());
                     break;
+                case "--repl-backlog-size":
+                    // how much of the stream is kept in memory for a replica to resume
+                    // from, in bytes. It has to be set before the first byte is recorded
+                    redisConfig.setReplBacklogSize(Integer.parseInt(args[i+1]));
+                    break;
             }
         }
 

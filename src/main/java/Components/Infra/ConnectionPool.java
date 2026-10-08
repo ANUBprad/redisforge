@@ -5,6 +5,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
@@ -14,6 +15,10 @@ public class ConnectionPool {
     // connections come and go on their own threads while propagation is walking the
     // replica set, so both sets and both counters have to tolerate that
     public final AtomicInteger slavesThatAreCaughtUp = new AtomicInteger();
+    // the lock a WAIT waits on: an acknowledgement increments the count and notifies
+    // under this same lock, so a waiter can never check the count and then block through
+    // the acknowledgement it was waiting for
+    private final Object acknowledgementLock = new Object();
 
     /**
      * Forgets what every replica has acknowledged, which is what a WAIT does when it
@@ -24,10 +29,55 @@ public class ConnectionPool {
      * again: an offset does not stop being acknowledged just because it was waited for.</p>
      */
     public void resetCaughtUpAccounting(){
-        for(Slave slave: slaves){
-            slave.clearAcknowledgement();
+        synchronized (acknowledgementLock) {
+            for (Slave slave : slaves) {
+                slave.clearAcknowledgement();
+            }
+            slavesThatAreCaughtUp.set(0);
         }
-        slavesThatAreCaughtUp.set(0);
+    }
+
+    /**
+     * Records that a replica acknowledged the position the write stream has reached, and
+     * wakes any WAIT that is waiting for it.
+     */
+    public void countCaughtUp() {
+        synchronized (acknowledgementLock) {
+            slavesThatAreCaughtUp.incrementAndGet();
+            acknowledgementLock.notifyAll();
+        }
+    }
+
+    /**
+     * Waits until at least {@code required} replicas have acknowledged, or until
+     * {@code timeoutMs} have passed, and returns how many have.
+     *
+     * <p>The count is checked under the same lock acknowledgements are made under, so
+     * the wait cannot start after the acknowledgement it is waiting for already arrived,
+     * and the thread blocks on the monitor instead of spinning for the whole timeout.</p>
+     */
+    public int awaitCaughtUp(int required, long timeoutMs) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        synchronized (acknowledgementLock) {
+            while (true) {
+                int caughtUp = slavesThatAreCaughtUp.get();
+                if (caughtUp >= required) {
+                    return caughtUp;
+                }
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (remainingMs <= 0) {
+                    return caughtUp;
+                }
+                try {
+                    // at least one millisecond, so a wait for a sub-millisecond remainder
+                    // cannot turn into an unbounded wait for a notification
+                    acknowledgementLock.wait(Math.max(1, remainingMs));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return slavesThatAreCaughtUp.get();
+                }
+            }
+        }
     }
     public ConnectionPool() {
         clients = ConcurrentHashMap.newKeySet();
@@ -114,5 +164,22 @@ public class ConnectionPool {
         }
 
         return slaves.remove(slaveToRemove);
+    }
+
+    /**
+     * Closes every connection this pool holds, which is what a server shutdown does so
+     * no handler is left blocked on a read. Closing is idempotent and the handlers'
+     * own cleanup removes what is left of each entry, so calling this twice is harmless.
+     */
+    public void closeAllConnections() {
+        for (Client client : new ArrayList<>(clients)) {
+            client.close();
+        }
+        for (Slave slave : new ArrayList<>(slaves)) {
+            slave.connection.close();
+        }
+        clients.clear();
+        slaves.clear();
+        slavesThatAreCaughtUp.set(0);
     }
 }

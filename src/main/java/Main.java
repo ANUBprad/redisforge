@@ -51,6 +51,16 @@ public class Main {
                     // from, in bytes. It has to be set before the first byte is recorded
                     redisConfig.setReplBacklogSize(Integer.parseInt(args[i+1]));
                     break;
+                case "--max-clients":
+                    // the ceiling on connections this process holds at once; one beyond it
+                    // is refused with an error instead of waiting for a thread
+                    redisConfig.setMaxClients(Integer.parseInt(args[i+1]));
+                    break;
+                case "--timeout":
+                    // seconds a connection may stay silent before it is reclaimed,
+                    // 0 disables the limit
+                    redisConfig.setClientTimeoutMs(Math.multiplyExact(Integer.parseInt(args[i+1]), 1000));
+                    break;
             }
         }
 

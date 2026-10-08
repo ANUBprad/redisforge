@@ -10,22 +10,18 @@ import Components.Service.RespSerializer;
 import Components.Infra.Client;
 import Components.Infra.RespStream;
 import Components.Service.ResponseDto;
+import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
@@ -46,44 +42,36 @@ public class MasterTcpServer {
     private Store store;
     @Autowired
     private AppendOnlyPersistence appendOnlyPersistence;
+    /** the listener, gate and handler pool this server runs its clients on */
+    private final ClientListener listener = new ClientListener("master", this::handleClient);
+
     public void startServer(){
-        ServerSocket serverSocket = null;
-        Socket clientSocket = null;
-        int port = redisConfig.getPort();
-        try {
-            serverSocket = new ServerSocket(port);
-            serverSocket.setReuseAddress(true);
-            int id = 0;
-            while (true) {
-                clientSocket = serverSocket.accept();
-                id++;
-                Socket finalClientSocket = clientSocket;
-
-                InputStream inputStream = clientSocket.getInputStream();
-                OutputStream outputStream = clientSocket.getOutputStream();
-
-                Client client = new Client(finalClientSocket, inputStream, outputStream, id );
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        handleClient(client);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-            }
-
-        } catch (IOException e) {
-            logger.log(Level.SEVERE, e.getMessage());
-        } finally {
-            try {
-                if (clientSocket != null) {
-                    clientSocket.close();
-                }
-            } catch (IOException e) {
-                logger.log(Level.SEVERE, e.getMessage());
-            }
-        }
+        listener.start(redisConfig.getPort(), redisConfig.getMaxClients(),
+                redisConfig.getClientTimeoutMs(), () -> { });
     }
+
+    /**
+     * Stops the server: the listener ends, every connection this context holds is
+     * closed so no handler stays blocked on a read, and the handler pool shuts down.
+     * Idempotent, and Spring calls it when the context closes.
+     */
+    public void stop() {
+        connectionPool.closeAllConnections();
+        listener.stop();
+        // a connection admitted in the moment the listener was closing is picked up here
+        connectionPool.closeAllConnections();
+    }
+
+    /** The client handlers currently running, which a shutdown can be waited on. */
+    public int activeClientHandlers() {
+        return listener.activeClientHandlers();
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        stop();
+    }
+
     private void handleClient(Client client) throws IOException {
         connectionPool.addClient(client);
         RespStream respStream = new RespStream(respSerializer);
@@ -98,6 +86,12 @@ public class MasterTcpServer {
                 // the rest of it arrives, and splits out every whole one
                 respStream.append(buffer, bytesRead);
                 for (String[] command : respStream.drain()) {
+                    if (command.length == 0) {
+                        // an empty array names no command and can never become a valid
+                        // one, so the stream cannot be resynchronised and must end
+                        client.send("-ERR Protocol error: empty multibulk request\r\n");
+                        return;
+                    }
                     handleCommand(command, client);
                 }
             }
@@ -131,8 +125,12 @@ public class MasterTcpServer {
 
     private void transactionController(String[] command, Client client) throws IOException {
         //control only comes here in the transaction context
-        switch (command[0]){
+        switch (command[0].toUpperCase(Locale.ROOT)){
             case "EXEC":
+                if (command.length != 1) {
+                    client.send(commandHandler.wrongNumberOfArguments("exec"));
+                    return;
+                }
                 if(client.commandQueue==null || client.commandQueue.isEmpty()){
                     client.send("*0\r\n");
                     client.endTransaction();
@@ -165,6 +163,10 @@ public class MasterTcpServer {
 
                 break;
             case "DISCARD":
+                if (command.length != 1) {
+                    client.send(commandHandler.wrongNumberOfArguments("discard"));
+                    return;
+                }
                 client.endTransaction();
                 client.send("+OK\r\n");
                 break;
@@ -198,7 +200,7 @@ public class MasterTcpServer {
     }
 
     private boolean isTransactionalControlCommand(String command) {
-        return switch (command) {
+        return switch (command.toUpperCase(Locale.ROOT)) {
             case "EXEC", "DISCARD" -> true;
             default -> false;
         };
@@ -208,21 +210,37 @@ public class MasterTcpServer {
         //control comes here only when the client is not in a transaction
         String res = "";
         byte[] data = null;
-        switch (command[0]){
+        switch (command[0].toUpperCase(Locale.ROOT)){
             case "PING":
                 res = commandHandler.ping(command);
                 break;
             case "EXEC":
+                if (command.length != 1) {
+                    res = commandHandler.wrongNumberOfArguments("exec");
+                    break;
+                }
                 res = "-ERR EXEC without MULTI\r\n";
                 break;
             case "DISCARD":
+                if (command.length != 1) {
+                    res = commandHandler.wrongNumberOfArguments("discard");
+                    break;
+                }
                 res = "-ERR DISCARD without MULTI\r\n";
                 break;
             case "MULTI":
+                if (command.length != 1) {
+                    res = commandHandler.wrongNumberOfArguments("multi");
+                    break;
+                }
                 client.beginTransaction();
                 res = "+OK\r\n";
                 break;
             case "INCR": {
+                if (command.length != 2) {
+                    res = commandHandler.wrongNumberOfArguments("incr");
+                    break;
+                }
                 // the file lock comes first and the key's lock inside it, which is the
                 // order a transaction takes them: applied, recorded and propagated under
                 // both, so replicas see the increments of a key in the order this master
@@ -272,13 +290,7 @@ public class MasterTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(redisConfig.getMasterReplOffset() == 0){
-                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
-                    break;
-                }
-                Instant start = Instant.now();
-                res = commandHandler.wait(command, start);
-                connectionPool.resetCaughtUpAccounting();
+                res = commandHandler.wait(command);
                 break;
             case "PSYNC":
                 // both answers are written by the handler itself while the backlog is held,
@@ -291,7 +303,16 @@ public class MasterTcpServer {
                 data = resDto.data;
                 break;
             case "BGREWRITEAOF":
+                if (command.length != 1) {
+                    res = commandHandler.wrongNumberOfArguments("bgrewriteaof");
+                    break;
+                }
                 res = rewriteAppendOnlyFile();
+                break;
+            default:
+                // the original spelling goes back in the reply, and the connection stays
+                // open: an unknown name is a client mistake, not a broken stream
+                res = "-ERR unknown command '" + command[0] + "'\r\n";
                 break;
         }
         return new ResponseDto(res, data);

@@ -8,6 +8,7 @@ import Components.Service.RespSerializer;
 import Components.Infra.Client;
 import Components.Infra.RespStream;
 import Components.Service.ResponseDto;
+import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -16,12 +17,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.ArrayList;
-import java.util.concurrent.CompletableFuture;
+import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -46,70 +45,55 @@ public class SlaveTcpServer {
     @Autowired
     private Store store;
 
-    private volatile boolean running = true;
+    /** the listener, gate and handler pool this server runs its clients on */
+    private final ClientListener listener = new ClientListener("replica", this::handleClient);
     /** the socket currently following the master, so shutting down can close it */
     private volatile Socket masterConnection;
     /** the retry waits on this, so stopping the server does not have to wait them out */
     private final Object retryLock = new Object();
-    private volatile ServerSocket serverSocket;
 
     public void startServer(){
-        Socket clientSocket = null;
-        int port = redisConfig.getPort();
+        listener.start(redisConfig.getPort(), redisConfig.getMaxClients(),
+                redisConfig.getClientTimeoutMs(), this::startFollower);
+    }
 
-        try {
-            serverSocket = new ServerSocket(port);
-            serverSocket.setReuseAddress(true);
-
-            // one thread follows the master for as long as this server runs. It hands the
-            // stream over when the master hangs up and looks for it again when there is
-            // none, so a replica that starts too early, or loses its master, recovers by
-            // itself. Exactly one thread and one socket at a time, which is what keeps a
-            // reconnect from duplicating the stream or applying a write twice.
-            Thread follower = new Thread(this::followMasterUntilStopped, "replication-follower");
-            follower.setDaemon(true);
-            follower.start();
-
-            int id = 0;
-            while (running) {
-                clientSocket = serverSocket.accept();
-                id++;
-                Socket finalClientSocket = clientSocket;
-
-                InputStream inputStream = clientSocket.getInputStream();
-                OutputStream outputStream = clientSocket.getOutputStream();
-
-                Client client = new Client(finalClientSocket, inputStream, outputStream, id );
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        handleClient(client);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-            }
-
-        } catch (IOException e) {
-            if (running) {
-                logger.log(Level.SEVERE, e.getMessage());
-            }
-        } finally {
-            closeQuietly(clientSocket);
-        }
+    /**
+     * One thread follows the master for as long as this server runs. It hands the
+     * stream over when the master hangs up and looks for it again when there is
+     * none, so a replica that starts too early, or loses its master, recovers by
+     * itself. Exactly one thread and one socket at a time, which is what keeps a
+     * reconnect from duplicating the stream or applying a write twice.
+     */
+    private void startFollower() {
+        Thread follower = new Thread(this::followMasterUntilStopped, "replication-follower");
+        follower.setDaemon(true);
+        follower.start();
     }
 
     /**
      * Stops the server: no further retries, and the sockets it is holding are closed so
      * neither the accept loop nor a read that is waiting on the master can hold the
-     * process open.
+     * process open. Idempotent, and Spring calls it when the context closes.
      */
     public void stop() {
-        running = false;
+        connectionPool.closeAllConnections();
+        listener.stop();
+        // a connection admitted in the moment the listener was closing is picked up here
+        connectionPool.closeAllConnections();
         synchronized (retryLock) {
             retryLock.notifyAll();
         }
         closeQuietly(masterConnection);
-        closeQuietly(serverSocket);
+    }
+
+    /** The client handlers currently running, which a shutdown can be waited on. */
+    public int activeClientHandlers() {
+        return listener.activeClientHandlers();
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        stop();
     }
 
     /**
@@ -122,19 +106,25 @@ public class SlaveTcpServer {
      */
     private void followMasterUntilStopped() {
         long delay = FIRST_RETRY_DELAY_MS;
-        while (running) {
+        while (listener.isRunning()) {
             try {
                 if (followMasterOnce()) {
                     // the handshake worked, so the next wait starts at the floor again
                     delay = FIRST_RETRY_DELAY_MS;
                 }
             } catch (IOException e) {
-                if (running) {
+                if (listener.isRunning()) {
                     logger.log(Level.WARNING, "the master is not available ("
                             + e.getMessage() + "), looking for it again in " + delay + "ms");
                 }
+            } catch (RuntimeException unexpected) {
+                // one bad frame or one failed apply must not take the follower down for
+                // good: the connection is dropped and the next attempt starts clean
+                if (listener.isRunning()) {
+                    logger.log(Level.SEVERE, "following the master failed unexpectedly", unexpected);
+                }
             }
-            if (!running || !waitBeforeRetry(delay)) {
+            if (!listener.isRunning() || !waitBeforeRetry(delay)) {
                 return;
             }
             delay = Math.min(delay * 2, MAX_RETRY_DELAY_MS);
@@ -215,7 +205,7 @@ public class SlaveTcpServer {
      */
     private boolean waitBeforeRetry(long delay) {
         synchronized (retryLock) {
-            if (!running) {
+            if (!listener.isRunning()) {
                 return false;
             }
             try {
@@ -224,22 +214,11 @@ public class SlaveTcpServer {
                 Thread.currentThread().interrupt();
                 return false;
             }
-            return running;
+            return listener.isRunning();
         }
     }
 
     private void closeQuietly(Socket socket) {
-        if (socket == null) {
-            return;
-        }
-        try {
-            socket.close();
-        } catch (IOException e) {
-            logger.log(Level.FINE, e.getMessage());
-        }
-    }
-
-    private void closeQuietly(ServerSocket socket) {
         if (socket == null) {
             return;
         }
@@ -263,6 +242,12 @@ public class SlaveTcpServer {
         while ((bytesRead = master.inputStream.read(buffer)) != -1) {
             replicated.append(buffer, bytesRead);
             for (String[] command : replicated.drain()) {
+                if (command.length == 0) {
+                    // the master cannot be trusted with the framing any more: the stream
+                    // cannot be resynchronised, so this connection ends and the follower
+                    // looks for the master again
+                    throw new IOException("the master sent an empty multibulk request");
+                }
                 String response = handleCommandFromMaster(command, master);
                 if(response != null && !response.isEmpty())
                     master.outputStream.write(response.getBytes());
@@ -374,8 +359,7 @@ public class SlaveTcpServer {
     }
 
     private String handleCommandFromMaster(String[] command, Client master) {
-        String cmd = command[0];
-        cmd = cmd.toUpperCase();
+        String cmd = command[0].toUpperCase(Locale.ROOT);
 
         String res = "";
         switch (cmd){
@@ -480,6 +464,12 @@ public class SlaveTcpServer {
                 // the rest of it arrives, and splits out every whole one
                 respStream.append(buffer, bytesRead);
                 for (String[] command : respStream.drain()) {
+                    if (command.length == 0) {
+                        // an empty array names no command and can never become a valid
+                        // one, so the stream cannot be resynchronised and must end
+                        client.send("-ERR Protocol error: empty multibulk request\r\n");
+                        return;
+                    }
                     handleCommand(command, client);
                 }
             }
@@ -495,16 +485,23 @@ public class SlaveTcpServer {
     private void handleCommand(String[] command, Client client) throws IOException {
         String res = "";
         byte[] data = null;
-        switch (command[0]){
+        switch (command[0].toUpperCase(Locale.ROOT)){
             case "PING":
                 res = commandHandler.ping(command);
                 break;
             case "ECHO":
                 res = commandHandler.echo(command);
                 break;
-            case "SET":
-                res = "-READONLY You can't write against a replica.\r\n";
+            case "SET": {
+                // the form of the command is checked before the replica says what it
+                // thinks of the write itself, so a malformed SET is a protocol answer
+                // rather than a refusal of something that was never a valid command
+                CommandHandler.SetForm form = commandHandler.parseSetForm(command);
+                res = form.error() != null
+                        ? form.error()
+                        : "-READONLY You can't write against a replica.\r\n";
                 break;
+            }
             case "GET":
                 res = commandHandler.get(command);
                 break;
@@ -527,20 +524,20 @@ public class SlaveTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(redisConfig.getMasterReplOffset() == 0){
-                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
-                    break;
-                }
-
-                Instant start = Instant.now();
-                res = commandHandler.wait(command, start);
-                connectionPool.resetCaughtUpAccounting();
+                res = commandHandler.wait(command);
                 break;
             case "BGREWRITEAOF":
+                if (command.length != 1) {
+                    res = commandHandler.wrongNumberOfArguments("bgrewriteaof");
+                    break;
+                }
                 // a replica keeps no file of its own: what it holds came from its master's
                 // stream, so there is nothing here for a local rewrite to compact. The reply
                 // matters, because a client that gets no answer waits forever.
                 res = "-ERR no append only file to rewrite\r\n";
+                break;
+            default:
+                res = "-ERR unknown command '" + command[0] + "'\r\n";
                 break;
         }
         client.send(res, data);

@@ -11,6 +11,10 @@ public class RedisConfig {
 
     /** how much of the replication stream is kept for a replica to resume from */
     public static final int DEFAULT_REPL_BACKLOG_SIZE = 1_048_576;
+    /** the most client connections one server holds at once */
+    public static final int DEFAULT_MAX_CLIENTS = 256;
+    /** how long a connection may sit silent before it is reclaimed; 0 disables the limit */
+    public static final int DEFAULT_CLIENT_TIMEOUT_MS = 300_000;
 
     private String role;
     private int port;
@@ -19,10 +23,12 @@ public class RedisConfig {
     private boolean appendonly = false;
     private String appendfilename = "appendonly.aof";
     private String appendfsync = "everysec";
-    private String masterReplId = null;
-    // written by the upstream replication thread and read by whatever thread answers a
-    // GETACK or reports on INFO
-    private volatile Long masterReplOffset = null;
+    private int maxClients = DEFAULT_MAX_CLIENTS;
+    private int clientTimeoutMs = DEFAULT_CLIENT_TIMEOUT_MS;
+    // named from the moment this config exists: reading it from two threads before it
+    // was ever written would otherwise race the lazy initialization
+    private volatile String masterReplId = newReplicationId();
+    private volatile Long masterReplOffset = 0L;
     /**
      * The tail of the stream, kept so a replica can be told to carry on instead of starting
      * again. It is also the lock the stream is counted and sent under, so its identity has
@@ -41,10 +47,6 @@ public class RedisConfig {
     private volatile boolean adoptedStream = false;
 
     public String getMasterReplId() {
-        if(masterReplId == null){
-            masterReplId = UUID.randomUUID().toString().replace("-", "")
-                    +  UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        }
         return masterReplId;
     }
 
@@ -53,10 +55,12 @@ public class RedisConfig {
     }
 
     public Long getMasterReplOffset() {
-        if(masterReplOffset == null){
-            masterReplOffset = 0L;
-        }
         return masterReplOffset;
+    }
+
+    private static String newReplicationId() {
+        return UUID.randomUUID().toString().replace("-", "")
+                + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     }
 
     /**
@@ -191,6 +195,38 @@ public class RedisConfig {
 
     public void setAppendfsync(String appendfsync) {
         this.appendfsync = appendfsync;
+    }
+
+    public int getMaxClients() {
+        return maxClients;
+    }
+
+    /**
+     * How many client connections one server process will hold at once. A connection
+     * beyond the limit is refused with an error instead of being queued for a thread
+     * that may never come, so the number is a real ceiling on the server's load.
+     */
+    public void setMaxClients(int maxClients) {
+        if (maxClients < 1) {
+            throw new IllegalArgumentException("max clients must be at least 1, got " + maxClients);
+        }
+        this.maxClients = maxClients;
+    }
+
+    public int getClientTimeoutMs() {
+        return clientTimeoutMs;
+    }
+
+    /**
+     * How long a connection may stay silent before the server reclaims it, in
+     * milliseconds; 0 disables the limit. Registered replicas are exempt: a replica's
+     * connection is idle by design between the writes its master has to send it.
+     */
+    public void setClientTimeoutMs(int clientTimeoutMs) {
+        if (clientTimeoutMs < 0) {
+            throw new IllegalArgumentException("client timeout must not be negative, got " + clientTimeoutMs);
+        }
+        this.clientTimeoutMs = clientTimeoutMs;
     }
 
 }

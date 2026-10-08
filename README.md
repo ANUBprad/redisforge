@@ -50,6 +50,8 @@ Options:
 | `--appendfilename <path>` | Where the append-only file is kept | `appendonly.aof` |
 | `--appendfsync always\|everysec\|no` | How often the file is flushed to disk | `everysec` |
 | `--repl-backlog-size <bytes>` | How much of the replication stream a master keeps for partial resyncs | `1048576` |
+| `--max-clients <count>` | Connections accepted at once; one more is refused with an error | `256` |
+| `--timeout <seconds>` | Close a connection that stays silent this long; `0` disables | `300` |
 
 Start a replica:
 
@@ -146,6 +148,52 @@ image you published.
 
 Write commands are rejected with `-READONLY`. `BGREWRITEAOF` is recognized but refused
 with `-ERR no append only file to rewrite`, since a replica keeps no file of its own.
+
+## Errors and protocol limits
+
+- An unknown command is answered with `-ERR unknown command '<name>'` and the connection
+  stays open: the original spelling is reflected back, in any letter case.
+- A known command with the wrong number of arguments is answered with
+  `-ERR wrong number of arguments for '<name>' command` and the connection stays open.
+- `SET` accepts the `PX` option in any letter case; an option it does not know is refused
+  with `-ERR unsupported option '<option>'` instead of being silently ignored. A
+  non-numeric expiry answers `-ERR value is not an integer or out of range`, and zero or
+  a negative one answers `-ERR invalid expire time in 'set' command`. A refused `SET`
+  stores nothing.
+- `INFO` answers `# Server` and `# Replication` for a bare `INFO` or `INFO all`, just
+  `# Replication` for `INFO replication`, just `# Server` for `INFO server`, and
+  `-ERR Invalid INFO section specified` for anything else.
+- An empty multibulk request (`*0`) cannot be resynchronised from, so it is answered with
+  `-ERR Protocol error: empty multibulk request` and the connection is closed.
+- Errors are replies, not disconnects: after any of the above (except the protocol
+  error), the same connection can keep sending commands.
+
+## Concurrency and limits
+
+- Each server (master and replica each own one) serves its clients on its own bounded
+  thread pool of at most `--max-clients` threads, so client traffic never competes for
+  the JVM's common pool and a slow client cannot grow the thread count without limit.
+- At most `--max-clients` connections are admitted at once. One more is refused
+  immediately with `-ERR max number of clients reached` and hung up, rather than queued
+  for a thread that may never come. Connections already admitted keep being answered
+  while the gate is full.
+- Keys are protected by a fixed pool of 256 striped locks. Transactions take every
+  stripe they need in a single global order, so two transactions that touch the same
+  keys in opposite orders cannot deadlock.
+- With `--timeout` set above 0, a connection that sends nothing for that long is
+  reclaimed by the server; a registered replica is exempt while it follows its master.
+- A replica write attempt, an unknown command and an arity mistake are answered with an
+  error on the connection that sent them and affect nothing else.
+
+## Shutdown
+
+- The servers stop promptly: new connections stop being admitted, open client
+  connections are closed so no handler waits on a read forever, and in-flight handlers
+  get a short grace period before being cut off.
+- Stopping twice is harmless, and a server that is started again after a stop works
+  like a fresh one, including rebinding its port.
+- Spring calls `stop()` when the application context closes (`@PreDestroy`), so the
+  process does not outlive its context with sockets still open.
 
 ## Limitations
 

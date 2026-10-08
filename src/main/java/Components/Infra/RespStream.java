@@ -6,8 +6,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
  * Holds the bytes of one connection between the TCP socket and the RESP parser.
@@ -16,8 +14,6 @@ import java.util.logging.Logger;
  * stays here and is decoded once the rest of it arrives.
  */
 public class RespStream {
-    private static final Logger logger = Logger.getLogger(RespStream.class.getName());
-
     private final RespSerializer respSerializer;
     private byte[] buffered = new byte[0];
     private int filled = 0;
@@ -53,7 +49,8 @@ public class RespStream {
                 break;
             }
             if(frameLength == RespSerializer.MALFORMED_FRAME){
-                logger.log(Level.WARNING, "closing connection, buffered bytes are not a RESP array");
+                // no log line here: the wrapper that owns this connection logs the
+                // failure once, with the client it belongs to, rather than twice
                 throw new IOException("malformed RESP frame at offset " + consumed);
             }
             commands.addAll(respSerializer.deseralize(buffered, consumed, consumed + frameLength));

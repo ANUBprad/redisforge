@@ -19,12 +19,20 @@ import java.util.logging.Logger;
 @Component
 public class Store {
     private static final Logger logger = Logger.getLogger(Store.class.getName());
+    /**
+     * How many locks the keys of this store are spread over. A fixed number: the lock
+     * striping never grows with the keyspace, so a server that has written millions of
+     * one-off keys holds no more lock objects than one that has written a handful.
+     */
+    private static final int KEY_LOCK_COUNT = 256;
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
-    // one lock per key, so a compound operation on a key cannot interleave with another
-    // one on the same key while keys keep running independently of each other. A
-    // ReentrantLock rather than a monitor, because a transaction has to hold the locks of
-    // several keys at once and release them one by one at the end.
-    private final ConcurrentHashMap<String, ReentrantLock> keyLocks = new ConcurrentHashMap<>();
+    // one stripe of locks guards a share of the keys, so a compound operation on a key
+    // cannot interleave with another one on the same key while keys keep running
+    // independently of each other. A fixed array rather than a per-key map, because a
+    // lock per key would be one more unbounded map to grow and then try to shrink. A
+    // ReentrantLock rather than a monitor, because a transaction has to hold the locks
+    // of several stripes at once and release them one by one at the end.
+    private final ReentrantLock[] keyLocks = createKeyLocks();
     public ConcurrentHashMap<String, Value> map;
     @Autowired
     public RespSerializer respSerializer;
@@ -32,15 +40,39 @@ public class Store {
         map = new ConcurrentHashMap<>();
     }
 
-    /** The lock that guards a single key. Held across a read followed by a write. */
-    public ReentrantLock lockFor(String key) {
-        return keyLocks.computeIfAbsent(key, k -> new ReentrantLock());
+    private static ReentrantLock[] createKeyLocks() {
+        ReentrantLock[] stripes = new ReentrantLock[KEY_LOCK_COUNT];
+        for (int i = 0; i < stripes.length; i++) {
+            stripes[i] = new ReentrantLock();
+        }
+        return stripes;
     }
 
+    /** The stripe a key's lock lives on. */
+    private static int stripeOf(String key) {
+        // & 0x7fffffff keeps a hash of Integer.MIN_VALUE from producing a negative
+        // index, whatever the key's hash happens to be
+        return (key.hashCode() & 0x7fffffff) % KEY_LOCK_COUNT;
+    }
+
+    /** The lock that guards a single key. Held across a read followed by a write. */
+    public ReentrantLock lockFor(String key) {
+        return keyLocks[stripeOf(key)];
+    }
+
+    /** How many distinct locks the store spreads its keys over, which never grows. */
+    public int keyLockCount() {
+        return KEY_LOCK_COUNT;
+    }
+
+    /**
+     * A snapshot of the keys the store currently holds, safe to iterate without
+     * holding a lock of any kind: a key written after this call is not in it.
+     */
     public Set<String> getKeys(){
         rwLock.readLock().lock();
         try{
-            return map.keySet();
+            return Set.copyOf(map.keySet());
         }finally{
             rwLock.readLock().unlock();
         }
@@ -262,21 +294,28 @@ public Value peekValue(String key) {
     }
 
     /**
-     * Locks every key the queued commands name, in a fixed order, and returns the locks so
-     * the caller can release them again. The fixed order is what keeps two transactions
-     * that touch the same keys in opposite orders from waiting on each other forever.
+     * Locks every stripe the queued commands name, in a fixed order, and returns the
+     * locks so the caller can release them again. The fixed order is what keeps two
+     * transactions that touch the same keys in opposite orders from waiting on each
+     * other forever.
+     *
+     * <p>The stripes, not the keys, are what is acquired: two keys can share a stripe
+     * and so one lock, which a thread must take only once, because it has to be
+     * released the same number of times it was taken. Sorted by stripe index rather
+     * than by key, because striped locks are shared between keys - ordering keys alone
+     * would let two transactions walk into the same pair of locks from opposite sides.</p>
      */
     private List<ReentrantLock> lockKeysInOrder(Queue<String[]> commandQueue) {
-        Set<String> keys = new TreeSet<>();
+        Set<Integer> stripes = new TreeSet<>();
         for (String[] command : new ArrayList<>(commandQueue)) {
             if (command.length > 1) {
-                keys.add(command[1]);
+                stripes.add(stripeOf(command[1]));
             }
         }
 
-        List<ReentrantLock> held = new ArrayList<>(keys.size());
-        for (String key : keys) {
-            ReentrantLock keyLock = lockFor(key);
+        List<ReentrantLock> held = new ArrayList<>(stripes.size());
+        for (int stripe : stripes) {
+            ReentrantLock keyLock = keyLocks[stripe];
             keyLock.lock();
             held.add(keyLock);
         }

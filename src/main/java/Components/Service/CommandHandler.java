@@ -11,12 +11,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
-import java.time.Duration;
-import java.time.Instant;
+import java.net.SocketException;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Base64;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
@@ -34,64 +34,130 @@ public class CommandHandler {
     public RedisConfig redisConfig;
     @Autowired
     public ConnectionPool connectionPool;
+
+    /** What a command with the wrong number of arguments is answered with. */
+    public String wrongNumberOfArguments(String command) {
+        return "-ERR wrong number of arguments for '" + command + "' command\r\n";
+    }
+
     public String ping(String[] command){
+        if (command.length > 2) {
+            return wrongNumberOfArguments("ping");
+        }
         return "+PONG\r\n";
     }
+
     public String echo(String[] command){
+        if (command.length != 2) {
+            return wrongNumberOfArguments("echo");
+        }
         return respSerializer.serializeBulkString(command[1]);
     }
+
+    /**
+     * The one form {@code SET} is parsed into: key, value, an optional expiry in
+     * milliseconds, or the error the command must be answered with. Commands beyond
+     * {@code SET key value} and {@code SET key value px <millis>} are refused here
+     * rather than having an option silently ignored.
+     */
+    public record SetForm(String key, String value, Integer expiryMillis, String error) {
+    }
+
+    /** Parses a SET command, whatever its case, without touching the store. */
+    public SetForm parseSetForm(String[] command) {
+        if (command.length < 3 || command.length == 4 || command.length > 5) {
+            return new SetForm(null, null, null, wrongNumberOfArguments("set"));
+        }
+        if (command.length == 3) {
+            return new SetForm(command[1], command[2], null, null);
+        }
+        String option = command[3];
+        if (!"px".equalsIgnoreCase(option)) {
+            return new SetForm(null, null, null,
+                    "-ERR unsupported option '" + option + "'\r\n");
+        }
+        int millis;
+        try {
+            millis = Integer.parseInt(command[4]);
+        } catch (NumberFormatException notANumber) {
+            return new SetForm(null, null, null,
+                    "-ERR value is not an integer or out of range\r\n");
+        }
+        if (millis <= 0) {
+            return new SetForm(null, null, null,
+                    "-ERR invalid expire time in 'set' command\r\n");
+        }
+        return new SetForm(command[1], command[2], millis, null);
+    }
+
     public String set(String[] command){
-        // TODO global exception handling
-        try{
-            String key = command[1];
-            String value = command[2];
-
-            int pxFlag = Arrays.stream(command).toList().indexOf("px");
-            // -1
-            if(pxFlag > -1){
-                int delta = Integer.parseInt( command[ pxFlag + 1 ] );
-                return store.set(key, value, delta);
-            }else{
-                return store.set(key, value);
-            }
-        }catch (Exception e){
-            logger.log(Level.SEVERE, e.getMessage());
-            return "$-1\r\n";
+        SetForm form = parseSetForm(command);
+        if (form.error() != null) {
+            return form.error();
         }
+        if (form.expiryMillis() == null) {
+            return store.set(form.key(), form.value());
+        }
+        return store.set(form.key(), form.value(), form.expiryMillis());
     }
+
     public String get(String[] command){
-        try{
-            String key = command[1];
-            return store.get(key);
-        } catch (Exception e) {
-            logger.log(Level.SEVERE, e.getMessage());
-            return "$-1\r\n";
+        if (command.length != 2) {
+            return wrongNumberOfArguments("get");
         }
+        return store.get(command[1]);
     }
+
     public String info(String[] command){
-        // command[0]; info
-        int replication = Arrays.stream(command).toList().indexOf("replication");
-        if(replication > -1){
-            String role = "role:"+redisConfig.getRole();
-            String masterReplId = "master_replid:"+redisConfig.getMasterReplId();
-            String masterReplOffset = "master_repl_offset:"+redisConfig.getMasterReplOffset();
-
-            String []info = new String[]{role, masterReplId, masterReplOffset};
-
-            String replicationData = String.join("\r\n", info);
-
-            return respSerializer.serializeBulkString(replicationData);
+        if (command.length > 2) {
+            return wrongNumberOfArguments("info");
         }
-        return "";
+        if (command.length == 2) {
+            return switch (command[1].toLowerCase(Locale.ROOT)) {
+                case "replication" -> respSerializer.serializeBulkString(replicationInfo());
+                case "server" -> respSerializer.serializeBulkString(serverInfo());
+                case "all" -> respSerializer.serializeBulkString(
+                        serverInfo() + "\r\n" + replicationInfo());
+                default -> "-ERR Invalid INFO section specified\r\n";
+            };
+        }
+        return respSerializer.serializeBulkString(serverInfo() + "\r\n" + replicationInfo());
     }
+
+    private String serverInfo() {
+        return "# Server\r\nredis_version:1.0";
+    }
+
+    private String replicationInfo() {
+        String role = "role:" + redisConfig.getRole();
+        String masterReplId = "master_replid:" + redisConfig.getMasterReplId();
+        String masterReplOffset = "master_repl_offset:" + redisConfig.getMasterReplOffset();
+        return "# Replication\r\n" + String.join("\r\n",
+                new String[]{role, masterReplId, masterReplOffset});
+    }
+
     public String replconf(String[] command, Client client) {
+        if (command.length < 2) {
+            return wrongNumberOfArguments("replconf");
+        }
 
         switch (command[1]){
             case "GETACK":
+                if (command.length < 3) {
+                    return wrongNumberOfArguments("replconf");
+                }
                 String [] replconfAck = new String[]{"REPLCONF", "ACK", redisConfig.getMasterReplOffset()+""};
                 return respSerializer.respArray(replconfAck);
-            case "ACK":
-                long ackOffset = Long.parseLong(command[2]);
+            case "ACK": {
+                if (command.length < 3) {
+                    return wrongNumberOfArguments("replconf");
+                }
+                long ackOffset;
+                try {
+                    ackOffset = Long.parseLong(command[2]);
+                } catch (NumberFormatException notAnOffset) {
+                    return "-ERR value is not an integer or out of range\r\n";
+                }
                 // an acknowledgement only means something from a replica whose stream has
                 // started, and only for the position the write stream has actually reached:
                 // one naming an earlier position is a replica that has not caught up yet
@@ -99,11 +165,29 @@ public class CommandHandler {
                 if(replica != null && replica.isReady()
                         && ackOffset == redisConfig.getMasterReplOffset()
                         && replica.markAcknowledged()){
-                    connectionPool.slavesThatAreCaughtUp.incrementAndGet();
+                    connectionPool.countCaughtUp();
                 }
                 return "";
-            case "listening-port":
-                int listeningPort = Integer.parseInt(command[2]);
+            }
+            case "listening-port": {
+                if (command.length < 3) {
+                    return wrongNumberOfArguments("replconf");
+                }
+                int listeningPort;
+                try {
+                    listeningPort = Integer.parseInt(command[2]);
+                } catch (NumberFormatException notAPort) {
+                    return "-ERR value is not an integer or out of range\r\n";
+                }
+                // a registered replica is exempt from the idle timeout from here on: it
+                // sends nothing between the writes its master has to push at it, and being
+                // dropped for that silence would only make it reconnect and resync
+                try {
+                    client.socket.setSoTimeout(0);
+                } catch (SocketException e) {
+                    logger.log(Level.WARNING, "could not lift the idle timeout of a "
+                            + "registered replica: " + e.getMessage());
+                }
                 // one registration per replica. A reconnect can arrive while the connection it
                 // replaces is still being cleaned up, and two entries for one replica would
                 // mean every write was sent to it twice, so the earlier one is dropped and its
@@ -118,20 +202,24 @@ public class CommandHandler {
                     previous.connection.close();
                 }
                 return "+OK\r\n";
-
-            case "capa":
+            }
+            case "capa": {
+                if (command.length < 3) {
+                    return wrongNumberOfArguments("replconf");
+                }
                 Slave slave = connectionPool.slaveFor(client);
                 // capabilities are recorded against the registered replica, and a connection
                 // that never registered has none to record them on
                 if(slave == null){
                     return "+OK\r\n";
                 }
-                for(int i=0; i<command.length; i++){
+                for(int i=0; i + 1 < command.length; i++){
                     if(command[i].equals("capa")){
                         slave.capabilities.add(command[i+1]);
                     }
                 }
                 return "+OK\r\n";
+            }
         }
 
         return "+OK\r\n";
@@ -249,13 +337,36 @@ public class CommandHandler {
             slave.markReady();
         }
     }
-    public String wait(String[] command, Instant start) {
-        String[] getackarr = new String[] { "REPLCONF", "GETACK", "*" };
-        String getack = respSerializer.respArray(getackarr);
-        byte[] bytearr = getack.getBytes();
+    /**
+     * Answers WAIT: broadcasts a GETACK to every replica whose stream has started, then
+     * waits until the asked-for number of them has acknowledged the position the write
+     * stream has reached, or the timeout passes, and reports the lower of the two.
+     *
+     * <p>The acknowledgement wait blocks on the pool's monitor instead of spinning, and
+     * the accounting is reset only after a wait that really happened: a WAIT on a stream
+     * that has not moved reports what stands and leaves it standing.</p>
+     */
+    public String wait(String[] command) {
+        if (command.length != 3) {
+            return wrongNumberOfArguments("wait");
+        }
+        int required;
+        int time;
+        try {
+            required = Integer.parseInt(command[1]);
+            time = Integer.parseInt(command[2]);
+        } catch (NumberFormatException notANumber) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if (required < 0 || time < 0) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if (redisConfig.getMasterReplOffset() == 0) {
+            return respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp.get());
+        }
 
-        int required = Integer.parseInt(command[1]);
-        int time = Integer.parseInt(command[2]);
+        String[] getackarr = new String[] { "REPLCONF", "GETACK", "*" };
+        byte[] bytearr = respSerializer.respArray(getackarr).getBytes();
 
         // straight down the thread that is waiting, so a replica cannot answer this
         // GETACK before the writes that were propagated ahead of it
@@ -273,31 +384,28 @@ public class CommandHandler {
             }
         }
 
-        int res = 0;
-        while(true){
-            if(res>=required)
-                break;
-            if(Duration.between(start, Instant.now()).toMillis() >= time)
-                break;
-            res= connectionPool.slavesThatAreCaughtUp.get();
-        }
+        int res = connectionPool.awaitCaughtUp(required, time);
+        connectionPool.resetCaughtUpAccounting();
         // the offset counts replicated writes only. Folding the GETACK into it would
         // push it past the offset a replica reports back, and the next ACK would never match
-        if(res > required)
-            return respSerializer.respInteger(required);
-        return respSerializer.respInteger(res);
+        return respSerializer.respInteger(Math.min(res, required));
     }
+
     public String incr(String[] command) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments("incr");
+        }
         // the store owns the read, parse, increment and write, so two clients cannot read
         // the same value and both store the same successor
         return store.increment(command[1]);
     }
+
     public BiFunction<String[], Map<String, Value>, String> getTransactionCommandCacheApplier(){
         final Store localStore = this.store;
         final RespSerializer localSerializer = this.respSerializer;
         return (String[] command, Map<String, Value> map)->{
             String res = "";
-            switch (command[0]) {
+            switch (command[0].toUpperCase(Locale.ROOT)) {
                 case "SET":
                     res = handleSetCommandTransactional(command, map, localSerializer, localStore);
                     break;
@@ -319,6 +427,9 @@ public class CommandHandler {
     }
 
     private String handleDelCommandTransactional(String[] command, Map<String, Value> map, RespSerializer localSerializer, Store localStore) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments("del");
+        }
         String key = command[1];
         Value valueToUse;
         Value cachedValue = map.getOrDefault(key, null);
@@ -343,6 +454,9 @@ public class CommandHandler {
             Map<String, Value> map,
             RespSerializer localSerializer,
             Store localStore) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments("incr");
+        }
         try{
             String key = command[1];
             Value valueToUse;
@@ -371,6 +485,9 @@ public class CommandHandler {
             Map<String, Value> map,
             RespSerializer localSerializer,
             Store localStore) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments("get");
+        }
         String key = command[1];
         Value valueToUse;
         Value cachedValue = map.getOrDefault(key, null);
@@ -393,9 +510,17 @@ public class CommandHandler {
             Map<String, Value> map,
             RespSerializer localSerializer,
             Store localStore) {
-        String key = command[1];
-        Value newValue = new Value(command[2], LocalDateTime.now(), LocalDateTime.MAX);
-        map.put(key, newValue);
+        // the same form a direct SET must have, so a queued write carries its expiry
+        // into the transaction instead of having the option dropped on the way in
+        SetForm form = parseSetForm(command);
+        if (form.error() != null) {
+            return form.error();
+        }
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime expiry = form.expiryMillis() == null
+                ? LocalDateTime.MAX
+                : now.plus(form.expiryMillis(), ChronoUnit.MILLIS);
+        map.put(form.key(), new Value(form.value(), now, expiry));
         return "+OK\r\n";
     }
 }

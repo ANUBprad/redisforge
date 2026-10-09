@@ -4,6 +4,7 @@ import Components.Infra.Client;
 import Components.Service.RespSerializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -236,11 +237,169 @@ public class Store {
     }
 
     /**
- * The entry as it is stored, whatever its deadline says. Unlike {@link #getValue(String)}
- * this does not treat a key that has expired as gone, because the caller here wants the
- * deadline itself: an expiry that has just passed still has to be recorded faithfully.
- */
-public Value peekValue(String key) {
+     * The seconds left on a key, rounded the way Redis rounds them. A key that is gone,
+     * or whose deadline has already passed, answers {@code -2}; one with no deadline
+     * answers {@code -1}.
+     */
+    public String ttl(String key) {
+        Long remaining = remainingMillis(key);
+        if (remaining == null) return respSerializer.respInteger(-2);
+        if (remaining < 0) return respSerializer.respInteger(-1);
+        // Redis rounds the seconds to the nearest one rather than truncating
+        return respSerializer.respInteger((int) ((remaining + 500) / 1000));
+    }
+
+    public String pttl(String key) {
+        Long remaining = remainingMillis(key);
+        if (remaining == null) return respSerializer.respInteger(-2);
+        if (remaining < 0) return respSerializer.respInteger(-1);
+        return respSerializer.respInteger((int) (long) remaining);
+    }
+
+    /**
+     * Milliseconds left on a key, or {@code null} when the key is gone (including one
+     * whose deadline has already passed and is cleaned up here), or {@code -1} when it
+     * carries no deadline at all.
+     */
+    private Long remainingMillis(String key) {
+        LocalDateTime now = LocalDateTime.now();
+        Value value = map.get(key);
+        if (value == null) return null;
+        if (value.expiry.isBefore(now)) {
+            map.remove(key, value);
+            return null;
+        }
+        if (value.expiry.equals(LocalDateTime.MAX)) return -1L;
+        return Duration.between(now, value.expiry).toMillis();
+    }
+
+    public int expire(String key, int seconds) {
+        return setExpire(key, seconds <= 0 ? null : LocalDateTime.now().plusSeconds(seconds));
+    }
+
+    public int pexpire(String key, long milliseconds) {
+        return setExpire(key, milliseconds <= 0 ? null
+                : LocalDateTime.now().plus(milliseconds, ChronoUnit.MILLIS));
+    }
+
+    public int expireAt(String key, long unixTimeSeconds) {
+        return setExpire(key, absoluteOrClamp(Instant.ofEpochSecond(wrapSeconds(unixTimeSeconds))));
+    }
+
+    public int pexpireAt(String key, long unixTimeMillis) {
+        return setExpire(key, absoluteOrClamp(Instant.ofEpochMilli(unixTimeMillis)));
+    }
+
+    /**
+     * A deadline far enough out to overflow a calendar date is kept as "no deadline" rather
+     * than allowed to throw: the key lives, which is what a date that far in the future
+     * means. A deadline before the epoch is pinned to the start so it reads as passed.
+     */
+    public static LocalDateTime absoluteOrClamp(Instant instant) {
+        try {
+            return LocalDateTime.ofInstant(instant, ZoneId.systemDefault());
+        } catch (RuntimeException outOfRange) {
+            return instant.isAfter(Instant.now()) ? LocalDateTime.MAX : LocalDateTime.MIN;
+        }
+    }
+
+    /** {@link Instant#ofEpochSecond} throws on overflow, so an absurd second count is clamped. */
+    public static long wrapSeconds(long unixTimeSeconds) {
+        long maxSeconds = Instant.MAX.getEpochSecond();
+        long minSeconds = Instant.MIN.getEpochSecond();
+        if (unixTimeSeconds > maxSeconds) return maxSeconds;
+        if (unixTimeSeconds < minSeconds) return minSeconds;
+        return unixTimeSeconds;
+    }
+
+    /**
+     * Puts a deadline on an existing, unexpired key. A {@code null} deadline, or one that
+     * is not in the future, means the key must go now. Returns the number of keys the
+     * command changed: {@code 1} when it acted, {@code 0} when the key was absent.
+     */
+    private int setExpire(String key, LocalDateTime exp) {
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try {
+                Value value = map.get(key);
+                if (value == null) return 0;
+                LocalDateTime now = LocalDateTime.now();
+                if (value.expiry.isBefore(now)) {
+                    map.remove(key, value);
+                    return 0;
+                }
+                if (exp == null || !exp.isAfter(now)) {
+                    map.remove(key, value);
+                    return 1;
+                }
+                map.put(key, new Value(value.val, value.created, exp));
+                return 1;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        } finally {
+            keyLock.unlock();
+        }
+    }
+
+    public int persist(String key) {
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try {
+                Value value = map.get(key);
+                if (value == null) return 0;
+                LocalDateTime now = LocalDateTime.now();
+                if (value.expiry.isBefore(now)) {
+                    map.remove(key, value);
+                    return 0;
+                }
+                if (value.expiry.equals(LocalDateTime.MAX)) return 0;
+                map.put(key, new Value(value.val, value.created, LocalDateTime.MAX));
+                return 1;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        } finally {
+            keyLock.unlock();
+        }
+    }
+
+    public void removeExpired() {
+        List<String> candidates = new ArrayList<>();
+        rwLock.readLock().lock();
+        try {
+            int count = 0;
+            for (String k : map.keySet()) {
+                if (count++ >= 100) break;
+                candidates.add(k);
+            }
+        } finally {
+            rwLock.readLock().unlock();
+        }
+        LocalDateTime now = LocalDateTime.now();
+        for (String k : candidates) {
+            ReentrantLock lock = lockFor(k);
+            lock.lock();
+            try {
+                rwLock.writeLock().lock();
+                try {
+                    Value v = map.get(k);
+                    if (v != null && v.expiry.isBefore(now)) {
+                        map.remove(k, v);
+                    }
+                } finally {
+                    rwLock.writeLock().unlock();
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+    public Value peekValue(String key) {
         rwLock.readLock().lock();
         try{
             return map.get(key);

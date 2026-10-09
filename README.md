@@ -8,6 +8,8 @@ and asynchronous master/replica replication.
 
 - RESP protocol over a plain TCP socket
 - `PING`, `ECHO`, `GET`, `SET` (including `PX` millisecond expiry) and `INCR`
+- Key expiration: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
+  with lazy expiry on read and a bounded active sweep
 - Transactions via `MULTI` / `EXEC` / `DISCARD`
 - Append-only file persistence on the master, replayed at startup, compacted on demand
   with `BGREWRITEAOF`
@@ -80,6 +82,10 @@ java -jar target/redisforge.jar --appendonly yes --appendfilename data/appendonl
   milliseconds, `PXAT`. Replay keeps the deadline the client was given instead of
   starting the countdown again, so a key that expired while the server was down comes
   back absent.
+- The expiration commands are written the same absolute way: `EXPIRE`, `PEXPIRE`,
+  `EXPIREAT` and `PEXPIREAT` become a `PEXPIREAT` with the deadline the store ended up
+  holding, `PERSIST` is kept as `PERSIST`, and an expiration that removed the key becomes
+  a `DEL`. A refused expiration (the key was not there) is not written at all.
 - `--appendfsync always` flushes each write before it is acknowledged, `everysec` flushes
   once a second from a background thread, and `no` leaves flushing to the operating
   system. `no` and `everysec` can lose the last second of writes if the machine stops.
@@ -138,16 +144,23 @@ image you published.
 ### Master
 
 `PING`, `ECHO`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO replication`,
-`REPLCONF`, `PSYNC`, `WAIT`, `BGREWRITEAOF`
+`REPLCONF`, `PSYNC`, `WAIT`, `BGREWRITEAOF`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`,
+`PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
 `DEL` is only handled inside a transaction.
 
+`EXPIRE` / `PEXPIRE` answer `:1` when the deadline was set (or the key removed, for a
+non-positive delay) and `:0` when the key does not exist. `TTL` / `PTTL` answer the
+remaining time, `:-1` for a key with no deadline, and `:-2` for a key that is not there.
+`PERSIST` answers `:1` when a deadline was removed and `:0` when there was none.
+
 ### Replica
 
-`PING`, `ECHO`, `GET`, `INFO replication`, `REPLCONF`, `PSYNC`, `WAIT`
+`PING`, `ECHO`, `GET`, `TTL`, `PTTL`, `INFO replication`, `REPLCONF`, `PSYNC`, `WAIT`
 
-Write commands are rejected with `-READONLY`. `BGREWRITEAOF` is recognized but refused
-with `-ERR no append only file to rewrite`, since a replica keeps no file of its own.
+Write commands, including the expiration commands, are rejected with `-READONLY`.
+`BGREWRITEAOF` is recognized but refused with `-ERR no append only file to rewrite`,
+since a replica keeps no file of its own.
 
 ## Errors and protocol limits
 
@@ -216,8 +229,10 @@ with `-ERR no append only file to rewrite`, since a replica keeps no file of its
 - No failover: a master that goes away is not replaced, and there is no Sentinel or
   Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.
-- Keys expire lazily, when they are read. There is no background expiry sweep and no
-  eviction policy.
+- Keys expire lazily when they are read, and a bounded background sweep (100 keys per
+  tick) removes keys that are never read again. There is no eviction policy, and the
+  sweep's removals are not written to the append-only file or propagated: replicas drop
+  the same keys lazily or on the master's next deadline-carrying command.
 - Only the commands listed under [Supported commands](#supported-commands) are
   implemented; RedisForge is not a drop-in replacement for Redis.
 

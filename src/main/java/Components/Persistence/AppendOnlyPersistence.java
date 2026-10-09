@@ -331,7 +331,8 @@ public class AppendOnlyPersistence {
             return false;
         }
         return switch (command[0].toUpperCase()) {
-            case "SET", "INCR", "DEL" -> true;
+            case "SET", "INCR", "DEL",
+                 "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST" -> true;
             default -> false;
         };
     }
@@ -376,14 +377,56 @@ public class AppendOnlyPersistence {
      * store ended up with, every other command is kept exactly as it arrived.
      */
     private String[] frameFor(String[] command) {
-        if (command.length < 3 || !command[0].equalsIgnoreCase("SET")) {
-            return command;
+        String name = command[0].toUpperCase();
+        if (name.equals("SET")) {
+            if (command.length < 3) {
+                return command;
+            }
+            Long deadline = absoluteExpiryMillis(store.peekValue(command[1]));
+            if (deadline == null) {
+                return new String[]{"SET", command[1], command[2]};
+            }
+            return new String[]{"SET", command[1], command[2], "PXAT", String.valueOf(deadline)};
         }
-        Long deadline = absoluteExpiryMillis(store.peekValue(command[1]));
+        if (name.equals("EXPIRE") || name.equals("PEXPIRE")
+                || name.equals("EXPIREAT") || name.equals("PEXPIREAT")
+                || name.equals("PERSIST")) {
+            return expirationFrame(command[1]);
+        }
+        return command;
+    }
+
+    /**
+     * The state an expiration mutation left behind, as the frame that reproduces it on
+     * replay: a live key keeps its absolute deadline as PEXPIREAT, a key without one is a
+     * PERSIST, and a key the mutation removed is a DEL. The deadline is absolute, so a
+     * file replayed much later still expires the key when it should.
+     */
+    private String[] expirationFrame(String key) {
+        Value value = store.peekValue(key);
+        if (value == null || value.expiry.isBefore(LocalDateTime.now())) {
+            return new String[]{"DEL", key};
+        }
+        Long deadline = absoluteExpiryMillis(value);
         if (deadline == null) {
-            return new String[]{"SET", command[1], command[2]};
+            return new String[]{"PERSIST", key};
         }
-        return new String[]{"SET", command[1], command[2], "PXAT", String.valueOf(deadline)};
+        return new String[]{"PEXPIREAT", key, String.valueOf(deadline)};
+    }
+
+    /**
+     * The frame an applied expiration command is propagated as: the same absolute form
+     * the file keeps, so a replica expires the key at the instant the master did rather
+     * than counting the delay again from its own clock.
+     */
+    public String[] replicationFrame(String[] command) {
+        String name = command[0].toUpperCase();
+        if (name.equals("EXPIRE") || name.equals("PEXPIRE")
+                || name.equals("EXPIREAT") || name.equals("PEXPIREAT")
+                || name.equals("PERSIST")) {
+            return expirationFrame(command[1]);
+        }
+        return command;
     }
 
     /** null when the key does not expire. */
@@ -430,7 +473,7 @@ public class AppendOnlyPersistence {
                     replayTransaction(queued);
                     queued = null;
                 }
-                case "SET", "INCR", "DEL" -> {
+                case "SET", "INCR", "DEL", "PEXPIREAT", "PERSIST" -> {
                     if (queued == null) {
                         replayCommand(frame);
                     } else {
@@ -474,6 +517,20 @@ public class AppendOnlyPersistence {
                 for (int i = 1; i < command.length; i++) {
                     store.delete(command[i]);
                 }
+            }
+            case "PEXPIREAT" -> {
+                requireArity(command, 3);
+                long deadline;
+                try {
+                    deadline = Long.parseLong(command[2]);
+                } catch (NumberFormatException e) {
+                    throw corrupt("PEXPIREAT with an unreadable deadline '" + command[2] + "'");
+                }
+                store.pexpireAt(command[1], deadline);
+            }
+            case "PERSIST" -> {
+                requireArity(command, 2);
+                store.persist(command[1]);
             }
             default -> throw corrupt("unknown command '" + command[0] + "'");
         }

@@ -12,6 +12,8 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.net.SocketException;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -106,6 +108,66 @@ public class CommandHandler {
             return wrongNumberOfArguments("get");
         }
         return store.get(command[1]);
+    }
+
+    public String expire(String[] command) {
+        if (command.length != 3) return wrongNumberOfArguments("expire");
+        try {
+            int seconds = Integer.parseInt(command[2]);
+            int res = store.expire(command[1], seconds);
+            return respSerializer.respInteger(res);
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+    }
+
+    public String pexpire(String[] command) {
+        if (command.length != 3) return wrongNumberOfArguments("pexpire");
+        try {
+            long millis = Long.parseLong(command[2]);
+            int res = store.pexpire(command[1], millis);
+            return respSerializer.respInteger(res);
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+    }
+
+    public String expireAt(String[] command) {
+        if (command.length != 3) return wrongNumberOfArguments("expireat");
+        try {
+            long unix = Long.parseLong(command[2]);
+            int res = store.expireAt(command[1], unix);
+            return respSerializer.respInteger(res);
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+    }
+
+    public String pexpireAt(String[] command) {
+        if (command.length != 3) return wrongNumberOfArguments("pexpireat");
+        try {
+            long unix = Long.parseLong(command[2]);
+            int res = store.pexpireAt(command[1], unix);
+            return respSerializer.respInteger(res);
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+    }
+
+    public String ttl(String[] command) {
+        if (command.length != 2) return wrongNumberOfArguments("ttl");
+        return store.ttl(command[1]);
+    }
+
+    public String pttl(String[] command) {
+        if (command.length != 2) return wrongNumberOfArguments("pttl");
+        return store.pttl(command[1]);
+    }
+
+    public String persist(String[] command) {
+        if (command.length != 2) return wrongNumberOfArguments("persist");
+        int res = store.persist(command[1]);
+        return respSerializer.respInteger(res);
     }
 
     public String info(String[] command){
@@ -418,12 +480,120 @@ public class CommandHandler {
                 case "DEL":
                     res = handleDelCommandTransactional(command, map, localSerializer, localStore);
                     break;
+                case "EXPIRE":
+                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIRE");
+                    break;
+                case "PEXPIRE":
+                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIRE");
+                    break;
+                case "EXPIREAT":
+                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIREAT");
+                    break;
+                case "PEXPIREAT":
+                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIREAT");
+                    break;
+                case "PERSIST":
+                    res = handlePersistCommandTransactional(command, map, localStore);
+                    break;
+                case "TTL":
+                    res = handleTtlCommandTransactional(command, map, localStore, false);
+                    break;
+                case "PTTL":
+                    res = handleTtlCommandTransactional(command, map, localStore, true);
+                    break;
                 default:
                     res = "-ERR unknown command '"+command[0]+"'\r\n";
                     break;
             }
             return res;
         };
+    }
+
+    /**
+     * The value a queued command should work on, taken from the transaction's own cache
+     * when an earlier command already touched the key, and copied from the store
+     * otherwise. A key the store no longer holds is absent, so the command sees what the
+     * transaction will see.
+     */
+    private Value resolveTransactionalValue(String key, Map<String, Value> map, Store localStore) {
+        Value cached = map.get(key);
+        if (cached != null) {
+            return cached.isDeletedInTransaction ? null : cached;
+        }
+        Value storeValue = localStore.getValue(key);
+        if (storeValue == null) {
+            return null;
+        }
+        Value copy = new Value(storeValue.val, storeValue.created, storeValue.expiry);
+        map.put(key, copy);
+        return copy;
+    }
+
+    /**
+     * A queued EXPIRE and its siblings, applied to the transaction's view of the key. A
+     * non-positive or already-passed deadline deletes the key when the transaction
+     * commits, exactly as the same command would outside one.
+     */
+    private String handleExpireCommandTransactional(String[] command, Map<String, Value> map,
+                                                    Store localStore, String kind) {
+        if (command.length != 3) {
+            return wrongNumberOfArguments(kind.toLowerCase(Locale.ROOT));
+        }
+        long amount;
+        try {
+            amount = Long.parseLong(command[2]);
+        } catch (NumberFormatException e) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        Value value = resolveTransactionalValue(command[1], map, localStore);
+        if (value == null) {
+            return respSerializer.respInteger(0);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime exp = switch (kind) {
+            case "EXPIRE" -> amount <= 0 ? null : now.plusSeconds(amount);
+            case "PEXPIRE" -> amount <= 0 ? null : now.plus(amount, ChronoUnit.MILLIS);
+            case "EXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochSecond(Store.wrapSeconds(amount)));
+            case "PEXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochMilli(amount));
+            default -> null;
+        };
+        if (exp == null || !exp.isAfter(now)) {
+            value.isDeletedInTransaction = true;
+        } else {
+            value.expiry = exp;
+        }
+        return respSerializer.respInteger(1);
+    }
+
+    private String handlePersistCommandTransactional(String[] command, Map<String, Value> map, Store localStore) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments("persist");
+        }
+        Value value = resolveTransactionalValue(command[1], map, localStore);
+        if (value == null || value.expiry.equals(LocalDateTime.MAX)) {
+            return respSerializer.respInteger(0);
+        }
+        value.expiry = LocalDateTime.MAX;
+        return respSerializer.respInteger(1);
+    }
+
+    private String handleTtlCommandTransactional(String[] command, Map<String, Value> map,
+                                                 Store localStore, boolean millis) {
+        if (command.length != 2) {
+            return wrongNumberOfArguments(millis ? "pttl" : "ttl");
+        }
+        Value value = resolveTransactionalValue(command[1], map, localStore);
+        if (value == null) {
+            return respSerializer.respInteger(-2);
+        }
+        if (value.expiry.equals(LocalDateTime.MAX)) {
+            return respSerializer.respInteger(-1);
+        }
+        long remaining = Duration.between(LocalDateTime.now(), value.expiry).toMillis();
+        if (remaining < 0) {
+            return respSerializer.respInteger(-2);
+        }
+        return respSerializer.respInteger((int) (millis ? remaining : (remaining + 500) / 1000));
     }
 
     private String handleDelCommandTransactional(String[] command, Map<String, Value> map, RespSerializer localSerializer, Store localStore) {

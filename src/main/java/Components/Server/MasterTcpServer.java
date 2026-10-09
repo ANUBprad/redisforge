@@ -22,8 +22,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -45,9 +50,33 @@ public class MasterTcpServer {
     /** the listener, gate and handler pool this server runs its clients on */
     private final ClientListener listener = new ClientListener("master", this::handleClient);
 
+    /**
+     * Every so often the store is asked to drop a bounded sample of keys whose deadline
+     * has passed, so a key that is never read again still leaves the keyspace. The task
+     * runs only while the server does, and only once no matter how often start() is
+     * called.
+     */
+    private static final long ACTIVE_EXPIRY_PERIOD_MILLIS = 100;
+    private final AtomicBoolean activeExpiryStarted = new AtomicBoolean(false);
+    private ScheduledExecutorService activeExpiry;
+
     public void startServer(){
         listener.start(redisConfig.getPort(), redisConfig.getMaxClients(),
                 redisConfig.getClientTimeoutMs(), () -> { });
+        startActiveExpiry();
+    }
+
+    private void startActiveExpiry() {
+        if (!activeExpiryStarted.compareAndSet(false, true)) {
+            return;
+        }
+        activeExpiry = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "active-expiry");
+            thread.setDaemon(true);
+            return thread;
+        });
+        activeExpiry.scheduleWithFixedDelay(store::removeExpired,
+                ACTIVE_EXPIRY_PERIOD_MILLIS, ACTIVE_EXPIRY_PERIOD_MILLIS, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -56,6 +85,12 @@ public class MasterTcpServer {
      * Idempotent, and Spring calls it when the context closes.
      */
     public void stop() {
+        if (activeExpiry != null) {
+            activeExpiry.shutdownNow();
+            activeExpiry = null;
+            // lets a server that is started again after a stop get its sweep back
+            activeExpiryStarted.set(false);
+        }
         connectionPool.closeAllConnections();
         listener.stop();
         // a connection admitted in the moment the listener was closing is picked up here
@@ -153,8 +188,10 @@ public class MasterTcpServer {
                 client.endTransaction();
                 while(!commands.isEmpty()){
                     // each command is counted and sent as one step, so a replica that asks
-                    // to carry on between two of them is resumed at a whole frame
-                    propagate(commands.poll());
+                    // to carry on between two of them is resumed at a whole frame. An
+                    // expiration is sent in its absolute form, so a replica expiring the
+                    // key does not start the clock over on its own.
+                    propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
                 }
 
                 String response = respSerializer.respArray(client.transactionResponse);
@@ -283,6 +320,27 @@ public class MasterTcpServer {
             case "GET":
                 res = commandHandler.get(command);
                 break;
+            case "EXPIRE":
+                res = applyExpiration(command, () -> commandHandler.expire(command));
+                break;
+            case "PEXPIRE":
+                res = applyExpiration(command, () -> commandHandler.pexpire(command));
+                break;
+            case "EXPIREAT":
+                res = applyExpiration(command, () -> commandHandler.expireAt(command));
+                break;
+            case "PEXPIREAT":
+                res = applyExpiration(command, () -> commandHandler.pexpireAt(command));
+                break;
+            case "PERSIST":
+                res = applyExpiration(command, () -> commandHandler.persist(command));
+                break;
+            case "TTL":
+                res = commandHandler.ttl(command);
+                break;
+            case "PTTL":
+                res = commandHandler.pttl(command);
+                break;
             case "INFO":
                 res = commandHandler.info(command);
                 break;
@@ -335,6 +393,24 @@ public class MasterTcpServer {
             logger.log(Level.WARNING, "could not rewrite the append only file: " + e.getMessage());
             return "-ERR " + e.getMessage().replaceAll("[\\r\\n]+", " ") + "\r\n";
         }
+    }
+
+    /**
+     * A command that hangs a deadline on a key, or takes one off. The store applies it,
+     * and only a mutation that really happened ({@code :1}) is written down and passed
+     * on: a command refused because the key is gone changes nothing, so replaying it or
+     * sending it downstream would describe a change that never occurred. The frame is the
+     * absolute one, so replicas and the file expire the key at the same instant.
+     */
+    private String applyExpiration(String[] command, Supplier<String> action) {
+        return appendOnlyPersistence.locked(() -> {
+            String applied = action.get();
+            if (applied.equals(":1\r\n")) {
+                appendOnlyPersistence.appendApplied(command);
+                propagate(appendOnlyPersistence.replicationFrame(command));
+            }
+            return applied;
+        });
     }
 
     private void propagate(String[] command) {

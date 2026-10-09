@@ -374,11 +374,76 @@ public class SlaveTcpServer {
             case "DEL":
                 applyDeleteFromMaster(command);
                 break;
+            case "PEXPIREAT":
+                applyExpireAtFromMaster(command);
+                break;
+            case "PERSIST":
+                applyPersistFromMaster(command);
+                break;
+            case "EXPIRE", "PEXPIRE", "EXPIREAT":
+                applyRelativeExpireFromMaster(command);
+                break;
+            case "TTL", "PTTL":
+                // read-only: nothing to apply, but the command still travels down the
+                // chain so a replica below sees the same bytes and stays in step
+                passOn(command);
+                break;
             case "REPLCONF":
                 res = commandHandler.replconf(command, master);
                 break;
         }
         return res;
+    }
+
+    /**
+     * Applies the absolute deadline a master's expiration command carried. The deadline is
+     * the master's, so the key on this replica expires at the same wall-clock instant as
+     * on the master instead of the delay being counted again here.
+     */
+    private void applyExpireAtFromMaster(String[] command) {
+        if (command.length < 3) {
+            logger.log(Level.WARNING, "ignored a PEXPIREAT with no deadline: " + String.join(" ", command));
+            return;
+        }
+        try {
+            store.pexpireAt(command[1], Long.parseLong(command[2]));
+        } catch (NumberFormatException e) {
+            logger.log(Level.WARNING, "ignored a PEXPIREAT with an unreadable deadline: " + command[2]);
+        }
+        passOn(command);
+    }
+
+    private void applyPersistFromMaster(String[] command) {
+        if (command.length < 2) {
+            logger.log(Level.WARNING, "ignored a PERSIST with no key: " + String.join(" ", command));
+            return;
+        }
+        store.persist(command[1]);
+        passOn(command);
+    }
+
+    /**
+     * A relative expiration that travelled inside a transaction block instead of being
+     * normalised. Applied as sent, because a transaction's commands are passed on exactly
+     * as the master's stream carried them.
+     */
+    private void applyRelativeExpireFromMaster(String[] command) {
+        if (command.length < 3) {
+            logger.log(Level.WARNING, "ignored an expiration with no deadline: " + String.join(" ", command));
+            return;
+        }
+        try {
+            long amount = Long.parseLong(command[2]);
+            switch (command[0].toUpperCase(Locale.ROOT)) {
+                case "EXPIRE" -> store.expire(command[1], (int) amount);
+                case "PEXPIRE" -> store.pexpire(command[1], amount);
+                case "EXPIREAT" -> store.expireAt(command[1], amount);
+                default -> { }
+            }
+        } catch (NumberFormatException e) {
+            logger.log(Level.WARNING, "ignored an expiration with an unreadable deadline: " + command[2]);
+        }
+        passOn(command);
     }
 
     /**
@@ -504,6 +569,17 @@ public class SlaveTcpServer {
             }
             case "GET":
                 res = commandHandler.get(command);
+                break;
+            case "TTL":
+                res = commandHandler.ttl(command);
+                break;
+            case "PTTL":
+                res = commandHandler.pttl(command);
+                break;
+            case "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST":
+                // a replica takes its writes from its master, so a client's expiration is
+                // refused the same way any other write is
+                res = "-READONLY You can't write against a replica.\r\n";
                 break;
             case "INFO":
                 res = commandHandler.info(command);

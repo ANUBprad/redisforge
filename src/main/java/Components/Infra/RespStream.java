@@ -28,7 +28,11 @@ public class RespStream {
             return;
         }
         if(filled + length > buffered.length){
-            buffered = Arrays.copyOf(buffered, filled + length);
+            // grow geometrically: a large payload that arrives in many small socket reads
+            // would otherwise copy the growing prefix once per read, O(n^2) overall for a
+            // multi-megabyte value. Doubling the array amortises those copies away.
+            buffered = Arrays.copyOf(buffered,
+                    Math.max(filled + length, Math.max(8192, buffered.length * 2)));
         }
         System.arraycopy(chunk, 0, buffered, filled, length);
         filled += length;

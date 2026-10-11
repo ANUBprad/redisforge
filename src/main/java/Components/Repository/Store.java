@@ -6,6 +6,7 @@ import Components.Service.RespSerializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import java.time.Duration;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -435,14 +436,29 @@ public class Store {
         if (remaining == null) return respSerializer.respInteger(-2);
         if (remaining < 0) return respSerializer.respInteger(-1);
         // Redis rounds the seconds to the nearest one rather than truncating
-        return respSerializer.respInteger((int) ((remaining + 500) / 1000));
+        return respSerializer.respInteger(roundedSeconds(remaining));
     }
 
     public String pttl(String key) {
         Long remaining = remainingMillis(key);
         if (remaining == null) return respSerializer.respInteger(-2);
         if (remaining < 0) return respSerializer.respInteger(-1);
-        return respSerializer.respInteger((int) (long) remaining);
+        // answered as the full 64-bit number, which is what Redis writes: casting the
+        // milliseconds to an int would wrap anything beyond about 24 days to negative
+        return respSerializer.respInteger(remaining);
+    }
+
+    /**
+     * Milliseconds rounded to the nearest second. The <code>+500</code> itself would
+     * overflow on a deadline so far away that its milliseconds do not fit a signed long,
+     * and at that size the half second of rounding is noise, so an overflow just divides.
+     */
+    public static long roundedSeconds(long remainingMillis) {
+        try {
+            return Math.addExact(remainingMillis, 500) / 1000;
+        } catch (ArithmeticException overflow) {
+            return remainingMillis / 1000;
+        }
     }
 
     /**
@@ -462,7 +478,13 @@ public class Store {
         }
         if (value.expiry.equals(LocalDateTime.MAX)) return -1L;
         touch(value);
-        return Duration.between(now, value.expiry).toMillis();
+        try {
+            return Duration.between(now, value.expiry).toMillis();
+        } catch (ArithmeticException tooFarToMeasure) {
+            // a deadline far enough that the span does not fit a long still has "a long
+            // time left"; answering anything else would make a live key look expired
+            return Long.MAX_VALUE;
+        }
     }
 
     public int expire(String key, int seconds) {
@@ -580,11 +602,17 @@ public class Store {
     /**
      * The epoch millis of a value's deadline, or {@code null} for one that has none.
      * A deadline so far out it stopped meaning "sometime" is treated as none, the same
-     * way {@link #persist} and the AOF treat it.
+     * way {@link #persist} and the AOF treat it: a relative PEXPIRE lands on a year so
+     * far away that counting it in milliseconds overflows a long, and that deadline
+     * reads as a key that simply does not expire.
      */
     public Long absoluteExpiryMillis(Value value) {
         if (value == null || value.expiry == null || value.expiry.equals(LocalDateTime.MAX)) return null;
-        return value.expiry.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        try {
+            return value.expiry.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        } catch (ArithmeticException | DateTimeException notCountable) {
+            return null;
+        }
     }
 
     /**

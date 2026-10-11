@@ -13,3 +13,4 @@ target/
 *.key
 helm-*.tgz
 .DS_Store
+data/

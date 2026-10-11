@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.net.SocketException;
+import java.time.DateTimeException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -691,13 +692,20 @@ public class CommandHandler {
             return respSerializer.respInteger(0);
         }
         LocalDateTime now = LocalDateTime.now();
-        LocalDateTime exp = switch (kind) {
-            case "EXPIRE" -> amount <= 0 ? null : now.plusSeconds(amount);
-            case "PEXPIRE" -> amount <= 0 ? null : now.plus(amount, ChronoUnit.MILLIS);
-            case "EXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochSecond(Store.wrapSeconds(amount)));
-            case "PEXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochMilli(amount));
-            default -> null;
-        };
+        LocalDateTime exp;
+        try {
+            exp = switch (kind) {
+                case "EXPIRE" -> amount <= 0 ? null : now.plusSeconds(amount);
+                case "PEXPIRE" -> amount <= 0 ? null : now.plus(amount, ChronoUnit.MILLIS);
+                case "EXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochSecond(Store.wrapSeconds(amount)));
+                case "PEXPIREAT" -> Store.absoluteOrClamp(Instant.ofEpochMilli(amount));
+                default -> null;
+            };
+        } catch (ArithmeticException | DateTimeException deadlineTooFar) {
+            // a relative deadline so far out that it is not a date keeps the key forever,
+            // the same reading the absolute commands give a date beyond their range
+            exp = amount <= 0 ? null : LocalDateTime.MAX;
+        }
         if (exp == null || !exp.isAfter(now)) {
             value.isDeletedInTransaction = true;
         } else {
@@ -730,11 +738,16 @@ public class CommandHandler {
         if (value.expiry.equals(LocalDateTime.MAX)) {
             return respSerializer.respInteger(-1);
         }
-        long remaining = Duration.between(LocalDateTime.now(), value.expiry).toMillis();
+        long remaining;
+        try {
+            remaining = Duration.between(LocalDateTime.now(), value.expiry).toMillis();
+        } catch (ArithmeticException tooFarToMeasure) {
+            remaining = Long.MAX_VALUE;
+        }
         if (remaining < 0) {
             return respSerializer.respInteger(-2);
         }
-        return respSerializer.respInteger((int) (millis ? remaining : (remaining + 500) / 1000));
+        return respSerializer.respInteger(millis ? remaining : Store.roundedSeconds(remaining));
     }
 
     private String handleDelCommandTransactional(String[] command, Map<String, Value> map, RespSerializer localSerializer, Store localStore) {

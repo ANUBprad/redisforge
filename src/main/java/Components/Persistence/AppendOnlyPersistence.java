@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -487,7 +488,13 @@ public class AppendOnlyPersistence {
         if (value == null || value.expiry == null || value.expiry.equals(LocalDateTime.MAX)) {
             return null;
         }
-        return value.expiry.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        try {
+            return value.expiry.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+        } catch (ArithmeticException | DateTimeException notCountable) {
+            // a relative deadline lands on a year so far away that its milliseconds do not
+            // fit a long; it is kept as "no deadline", exactly like the infinity sentinel
+            return null;
+        }
     }
 
     /**

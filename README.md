@@ -44,6 +44,13 @@ test suite.
 mvn test
 ```
 
+## Continuous integration
+
+On every push to `main` and every pull request, the GitHub Actions workflow in
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs `mvn clean test` and
+then packages the jar with `mvn package -DskipTests`, uploading the surefire reports as
+an artifact.
+
 ## Run
 
 ```sh
@@ -191,11 +198,63 @@ hash, list or set, and the typed reads do the same against a string.
   or missing key answers the empty form: `:0` for the length and membership counts,
   `$-1` for a missing single value, and an empty array for a missing whole-key read.
 
+## Benchmark
+
+[`src/test/java/Components/Benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
+is a plain-JDK harness in the test tree that hammers a RedisForge server that is already
+up. It is deliberately not a JUnit test, so `mvn test` does not run it. Point it at a
+running server:
+
+```sh
+mvn test-compile
+java -cp target/test-classes Components.Benchmark.BenchmarkMain [host] [port]
+```
+
+It measures what a real client socket sees: 50,000 sequential `SET` and `GET` round
+trips; `SET` and `GET` pipelined 5,120 commands at a time; 20,000 `HSET` field-cells
+grown one at a time on a single hash; repeated `LRANGE` and `SMEMBERS` reads of a
+200-element collection; 1 MiB `SET` and `GET` values; and 8 concurrent clients doing
+2,000 `SET`+`GET` pairs each. The workload is fixed, so a repeat run on the same machine
+is reproducible; the figures are for the machine they ran on, not a ceiling.
+
+Measured in this repository, on one connection unless the row says concurrency, against
+the packaged jar:
+
+| Workload | ops/s | µs/op |
+| --- | ---: | ---: |
+| `SET` sequential (50,000) | 4,877 | 205 |
+| `GET` sequential (50,000) | 5,621 | 178 |
+| `SET` pipelined (10 × 5,120) | 8,332 | 120 |
+| `GET` pipelined (10 × 5,120) | 8,718 | 115 |
+| `HSET` on a 20,000-cell hash | 260 | 3,845 |
+| `LRANGE` on a 200-element list | 388 | 2,577 |
+| `SMEMBERS` on a 200-member set | 341 | 2,929 |
+| `SET` 1 MiB value | 2,947 | 339 |
+| `GET` 1 MiB value | 9,637 | 104 |
+| 8 concurrent clients (2,000 `SET`+`GET` each) | 14,132 | 71 |
+
+The typed rows are the semantics, not a defect: a mutation is computed against a copy of
+the whole collection and swapped in whole (see
+[Hashes, lists and sets](#hashes-lists-and-sets)), so an `HSET` into a 20,000-cell hash
+costs time in the hash's size, and a 200-element read rebuilds a 200-part reply every
+call.
+
 ## Docker
 
 ```sh
 docker build -t redisforge .
 docker run -p 6379:6379 redisforge
+```
+
+- The image is built in two stages — Maven compiles the jar on a JDK image, and a JRE
+  image runs it — and the server runs as a non-root user, `redisforge`, so a compromised
+  server does not hold the container's privileges.
+- The append-only file is written under `/data`, which the image owns. Mount a volume on
+  it to keep the file across container restarts:
+
+```sh
+docker run -p 6379:6379 -v redisforge-data:/data \
+  redisforge --appendonly yes --appendfilename /data/appendonly.aof
 ```
 
 Run a replica against a master reachable from the container:
@@ -340,6 +399,16 @@ with `-READONLY`. `BGREWRITEAOF` is recognized but refused with
   master's next deadline-carrying command. Eviction under `--maxmemory` is different: a
   key the policy removes is written down and propagated as a `DEL`, so a replica stays in
   step with its master (see [Memory limits](#memory-limits)).
+- An expiration so far out that counting its deadline in milliseconds overflows a long —
+  a relative `PEXPIRE` or `EXPIRE` of about 292 million years, or `Long.MAX_VALUE` —
+  is clamped to "no deadline": the key is held without one. `TTL` / `PTTL` still report a
+  huge remaining time on the live server, but the store, a full resync and the
+  append-only file treat the key as permanent, so such a key is kept forever rather than
+  expiring absurdly far in the future.
+- A typed write is computed against a copy of the whole collection and swapped in whole,
+  so mutating a hash, list or set costs time proportional to its size; an `HSET` into a
+  20,000-cell hash measures a few milliseconds on a desktop (see
+  [Benchmark](#benchmark)).
 - Only the commands listed under [Supported commands](#supported-commands) are
   implemented; RedisForge is not a drop-in replacement for Redis.
 

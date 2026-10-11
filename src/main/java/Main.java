@@ -1,7 +1,7 @@
 import Components.Persistence.AppendOnlyPersistence;
-import Components.Persistence.FsyncPolicy;
 import Components.Server.MasterTcpServer;
 import Components.Server.RedisConfig;
+import Components.Server.RedisForgeArgs;
 import Components.Server.SlaveTcpServer;
 import Config.AppConfig;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
@@ -16,63 +16,18 @@ public class Main {
         MasterTcpServer master = context.getBean(MasterTcpServer.class);
         SlaveTcpServer slave = context.getBean(SlaveTcpServer.class);
         RedisConfig redisConfig = context.getBean(RedisConfig.class);
-        int port = 6379;
-        redisConfig.setPort(port);
+        redisConfig.setPort(6379);
         redisConfig.setRole("master");
-        for(int i=0;i<args.length;i++){
-
-            switch(args[i]){
-                case "--port":
-                    port = Integer.parseInt(args[i+1]);
-                    redisConfig.setPort(port);
-                    break;
-                case "--replicaof":
-                    redisConfig.setRole("slave");
-//                    "<MASTER_HOST> <MASTER_PORT>"
-                    String masterHost = args[i+1].split(" ")[0];
-                    int masterPort = Integer.parseInt(args[i+1].split(" ")[1]);
-
-                    redisConfig.setMasterHost(masterHost);
-                    redisConfig.setMasterPort(masterPort);
-
-                    break;
-                case "--appendonly":
-                    redisConfig.setAppendonly(parseBoolean(args[i+1]));
-                    break;
-                case "--appendfilename":
-                    redisConfig.setAppendfilename(args[i+1]);
-                    break;
-                case "--appendfsync":
-                    // parsed here so a bad policy is refused before anything is opened
-                    redisConfig.setAppendfsync(FsyncPolicy.parse(args[i+1]).name().toLowerCase());
-                    break;
-                case "--repl-backlog-size":
-                    // how much of the stream is kept in memory for a replica to resume
-                    // from, in bytes. It has to be set before the first byte is recorded
-                    redisConfig.setReplBacklogSize(Integer.parseInt(args[i+1]));
-                    break;
-                case "--max-clients":
-                    // the ceiling on connections this process holds at once; one beyond it
-                    // is refused with an error instead of waiting for a thread
-                    redisConfig.setMaxClients(Integer.parseInt(args[i+1]));
-                    break;
-                case "--timeout":
-                    // seconds a connection may stay silent before it is reclaimed,
-                    // 0 disables the limit
-                    redisConfig.setClientTimeoutMs(Math.multiplyExact(Integer.parseInt(args[i+1]), 1000));
-                    break;
-                case "--maxmemory":
-                    // the ceiling on the estimated bytes of the keyspace, in bytes;
-                    // 0 means no limit
-                    redisConfig.setMaxmemory(Long.parseLong(args[i+1]));
-                    break;
-                case "--maxmemory-policy":
-                    // how a write past the ceiling is admitted: one of noeviction,
-                    // allkeys-lru, allkeys-random, volatile-lru, volatile-random,
-                    // volatile-ttl. An unknown name stops the server here
-                    redisConfig.setMaxmemoryPolicy(args[i+1]);
-                    break;
-            }
+        try {
+            RedisForgeArgs.apply(redisConfig, args);
+        } catch (IllegalArgumentException badOption) {
+            System.err.println("redisforge: " + badOption.getMessage());
+            System.err.println("options: --port <port> --replicaof \"<host> <port>\" "
+                    + "--appendonly yes|no --appendfilename <path> "
+                    + "--appendfsync always|everysec|no --repl-backlog-size <bytes> "
+                    + "--max-clients <count> --timeout <seconds> "
+                    + "--maxmemory <bytes> --maxmemory-policy <policy>");
+            System.exit(1);
         }
 
         AppendOnlyPersistence appendOnly = context.getBean(AppendOnlyPersistence.class);
@@ -90,15 +45,5 @@ public class Main {
             Runtime.getRuntime().addShutdownHook(new Thread(appendOnly::close, "appendonly-shutdown"));
             master.startServer();
         }
-    }
-
-    private static boolean parseBoolean(String value) {
-        if ("yes".equalsIgnoreCase(value) || "true".equalsIgnoreCase(value)) {
-            return true;
-        }
-        if ("no".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
-            return false;
-        }
-        throw new IllegalArgumentException("expected yes or no, got '" + value + "'");
     }
 }

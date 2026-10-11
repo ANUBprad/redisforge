@@ -79,4 +79,14 @@ class RespSerializerTest {
         assertEquals(RespSerializer.MALFORMED_FRAME,
                 respSerializer.frameLength("*3\r\n?3\r\nSET\r\n".getBytes(StandardCharsets.UTF_8), 0, 16));
     }
+
+    @Test
+    public void respIntegerCarriesAWholeLong(){
+        assertEquals(":42\r\n", respSerializer.respInteger(42));
+        assertEquals(":-2\r\n", respSerializer.respInteger(-2));
+        // 34 days in milliseconds: an int would wrap this to a negative number, and a
+        // PTTL that looked negative would read as a deadline that had already passed
+        assertEquals(":2937600000\r\n", respSerializer.respInteger(2_937_600_000L));
+        assertEquals(":" + Long.MAX_VALUE + "\r\n", respSerializer.respInteger(Long.MAX_VALUE));
+    }
 }

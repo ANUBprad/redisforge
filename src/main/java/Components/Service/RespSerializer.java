@@ -284,9 +284,19 @@ public class RespSerializer {
     }
 
     public String respInteger(int i){
+        return respInteger((long) i);
+    }
+
+    /**
+     * An integer reply as Redis writes one. The value is a signed 64-bit number, so a
+     * {@code long} is preserved whole: a {@code PTTL} that still has weeks - or years -
+     * on the clock would be truncated by an {@code int} and come back looking like a
+     * deadline that had already passed.
+     */
+    public String respInteger(long value){
         StringBuilder sb = new StringBuilder();
         sb.append(":");
-        sb.append(i);
+        sb.append(value);
         sb.append("\r\n");
         return sb.toString();
     }

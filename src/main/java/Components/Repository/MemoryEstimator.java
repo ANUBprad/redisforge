@@ -2,6 +2,7 @@ package Components.Repository;
 
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.util.Map;
 
 /**
  * The size a key is charged against {@code maxmemory}.
@@ -24,6 +25,12 @@ public final class MemoryEstimator {
     public static final long ENTRY_OVERHEAD_BYTES = 64;
     /** What a deadline adds to an entry, for the metadata that records it. */
     public static final long EXPIRY_METADATA_BYTES = 16;
+    /**
+     * What one field, element or member of a collection adds beyond its own bytes, for
+     * the slot that holds it. The same for every collection kind: the estimate is about
+     * the dataset the server reasons about, not about a particular map node.
+     */
+    public static final long ELEMENT_OVERHEAD_BYTES = 24;
 
     private MemoryEstimator() {
     }
@@ -45,6 +52,40 @@ public final class MemoryEstimator {
         long bytes = ENTRY_OVERHEAD_BYTES + utf8Length(key) + utf8Length(value);
         if (hasDeadline(expiry)) {
             bytes += EXPIRY_METADATA_BYTES;
+        }
+        return bytes;
+    }
+
+    /**
+     * The bytes one entry of any kind contributes: the fixed overhead, the key, the
+     * deadline metadata when there is one, and then what the kind itself holds. A string
+     * charges its value; a hash charges each field and its value; a list and a set charge
+     * each element or member. Every element carries {@link #ELEMENT_OVERHEAD_BYTES} on
+     * top of its own bytes.
+     */
+    public static long entryBytes(String key, Value value) {
+        long bytes = ENTRY_OVERHEAD_BYTES + utf8Length(key);
+        if (hasDeadline(value.expiry)) {
+            bytes += EXPIRY_METADATA_BYTES;
+        }
+        switch (value.kind) {
+            case STRING -> bytes += utf8Length(value.val);
+            case HASH -> {
+                for (Map.Entry<String, String> field : value.hash.entrySet()) {
+                    bytes += ELEMENT_OVERHEAD_BYTES
+                            + utf8Length(field.getKey()) + utf8Length(field.getValue());
+                }
+            }
+            case LIST -> {
+                for (String element : value.list) {
+                    bytes += ELEMENT_OVERHEAD_BYTES + utf8Length(element);
+                }
+            }
+            case SET -> {
+                for (String member : value.set) {
+                    bytes += ELEMENT_OVERHEAD_BYTES + utf8Length(member);
+                }
+            }
         }
         return bytes;
     }

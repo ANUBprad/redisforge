@@ -7,8 +7,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 
 public class Client {
@@ -20,6 +22,13 @@ public class Client {
     private boolean transactionalContext;
     public Queue<String[]> commandQueue;
     public List<String> transactionResponse; // the strings will be in resp format we just need to make a resp array out of it
+    /**
+     * The frame each queued command must be written down and passed on as, when that
+     * differs from the command itself. Only SPOP needs it: it pops members at random, so
+     * the transaction records the SREM of the members it actually popped, keyed by the
+     * exact command array so the order of the queue is preserved.
+     */
+    public Map<String[], String[]> transactionPropagation = new IdentityHashMap<>();
 
     /**
      * The replica this connection registered as, if it did. Set once when the connection
@@ -42,11 +51,13 @@ public class Client {
         transactionalContext = true;
         transactionResponse = new ArrayList<>();
         commandQueue = new LinkedList<>();
+        transactionPropagation = new IdentityHashMap<>();
         return transactionalContext;
     }
 
     public void endTransaction(){
         commandQueue = null;
+        transactionPropagation = new IdentityHashMap<>();
         transactionalContext=false;
     }
 

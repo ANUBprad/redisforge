@@ -6,6 +6,7 @@ import Components.Persistence.AppendOnlyPersistence;
 import Components.Repository.MemoryEstimator;
 import Components.Repository.MemoryManager;
 import Components.Repository.Store;
+import Components.Repository.TypedOps;
 import Components.Repository.Value;
 import Components.Service.CommandHandler;
 import Components.Service.RespSerializer;
@@ -180,7 +181,7 @@ public class MasterTcpServer {
                 Queue<String[]> commands = new LinkedList<>(client.commandQueue);
 
                 //execute the transaction
-                BiFunction<String[], Map<String, Value>, String> transactionCacheApplier = commandHandler.getTransactionCommandCacheApplier();
+                BiFunction<String[], Map<String, Value>, String> transactionCacheApplier = commandHandler.getTransactionCommandCacheApplier(client);
                 // the backlog lock is held across the store apply and the propagation of
                 // every command, so a full resync that cuts its snapshot in the middle of
                 // a transaction can never serialize a store whose writes are only half
@@ -210,8 +211,13 @@ public class MasterTcpServer {
                             // each command is counted and sent as one step, so a replica that asks
                             // to carry on between two of them is resumed at a whole frame. An
                             // expiration is sent in its absolute form, so a replica expiring the
-                            // key does not start the clock over on its own.
-                            propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
+                            // key does not start the clock over on its own. A typed command that
+                            // recorded its own frame - an SPOP written down as the SREM of the
+                            // members it popped - is sent as that frame instead.
+                            String[] queuedCommand = commands.poll();
+                            String[] override = client.transactionPropagation.get(queuedCommand);
+                            propagate(appendOnlyPersistence.replicationFrame(
+                                    override != null ? override : queuedCommand));
                         }
                     }
                 }
@@ -251,7 +257,8 @@ public class MasterTcpServer {
         int index = 0;
         for (String[] command : queued) {
             if (index < replies.size() && !replies.get(index).startsWith("-")) {
-                applied.add(command);
+                String[] override = client.transactionPropagation.get(command);
+                applied.add(override != null ? override : command);
             }
             index++;
         }
@@ -272,9 +279,16 @@ public class MasterTcpServer {
 
     public ResponseDto caseHandler(String[] command, Client client) throws IOException {
         //control comes here only when the client is not in a transaction
+        String name = command[0].toUpperCase(Locale.ROOT);
+        if (TypedOps.handles(name)) {
+            String typed = TypedOps.isRead(name)
+                    ? commandHandler.typedRead(command)
+                    : applyTyped(command);
+            return new ResponseDto(typed, null);
+        }
         String res = "";
         byte[] data = null;
-        switch (command[0].toUpperCase(Locale.ROOT)){
+        switch (name){
             case "PING":
                 res = commandHandler.ping(command);
                 break;
@@ -496,6 +510,49 @@ public class MasterTcpServer {
         String[] del = new String[]{"DEL", key};
         appendOnlyPersistence.appendApplied(del);
         propagate(del);
+    }
+
+    /**
+     * Applies one hash, list or set write: the command is computed against a copy, judged
+     * against the memory limit, committed, and then written down and passed on - all under
+     * one hold of the backlog lock and the file lock, in the order the SET and INCR paths
+     * take them. A refused or no-op command changes nothing and is neither recorded nor
+     * replicated.
+     *
+     * <p>What is recorded and passed on is the frame the mutation names, which is the
+     * command itself except for {@code SPOP}: a random pop is written down as the
+     * {@code SREM} of the members it took, so a replica and a replay remove exactly those
+     * members instead of drawing their own.</p>
+     */
+    private String applyTyped(String[] command) {
+        if (command.length < 2) {
+            return commandHandler.wrongNumberOfArguments(command[0].toLowerCase(Locale.ROOT));
+        }
+        String key = command[1];
+        synchronized (redisConfig.getReplicationBacklog()) {
+            return appendOnlyPersistence.locked(() -> {
+                Value current = store.valueCopy(key);
+                TypedOps.Mutation mutation = TypedOps.mutate(command, current);
+                if (mutation.reply().startsWith("-") || !mutation.changed()) {
+                    return mutation.reply();
+                }
+                long newEntryBytes = mutation.value() == null
+                        ? 0
+                        : MemoryEstimator.entryBytes(key, mutation.value());
+                MemoryManager.Admission admission = memoryManager.admit(key, newEntryBytes);
+                if (admission.rejected()) {
+                    return admission.error();
+                }
+                for (String evicted : admission.evictedKeys()) {
+                    evict(evicted);
+                }
+                store.commit(key, mutation.value());
+                String[] frame = mutation.propagation() != null ? mutation.propagation() : command;
+                appendOnlyPersistence.appendApplied(frame);
+                propagate(frame);
+                return mutation.reply();
+            });
+        }
     }
 
     /**

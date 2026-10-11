@@ -8,6 +8,11 @@ and asynchronous master/replica replication.
 
 - RESP protocol over a plain TCP socket
 - `PING`, `ECHO`, `GET`, `SET` (including `PX` millisecond expiry) and `INCR`
+- Hashes, lists and sets: `HSET`, `HGET`, `HGETALL`, `HKEYS`, `HVALS`, `HMGET`,
+  `HSTRLEN`, `HDEL`, `HSETNX`, `HLEN`, `HEXISTS`; `LPUSH`, `RPUSH`, `LPOP`, `RPOP`,
+  `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LREM`, `LTRIM`; `SADD`, `SREM`, `SISMEMBER`,
+  `SMISMEMBER`, `SCARD`, `SMEMBERS`, `SPOP`, `SRANDMEMBER`, with strict value-type
+  checking across every kind
 - Key expiration: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`,
   with lazy expiry on read and a bounded active sweep
 - Transactions via `MULTI` / `EXEC` / `DISCARD`
@@ -100,11 +105,12 @@ java -jar target/redisforge.jar --appendonly yes --appendfilename data/appendonl
   keyspace it cannot vouch for.
 - The file can be compacted at any time with `BGREWRITEAOF`. The reply is `+OK` only
   after the compact file is already on disk: it is built beside the original from the
-  state the store is holding now — one `SET` per live key, keeping each key's absolute
-  deadline and leaving out keys that have expired — forced whole, and then swapped into
-  place in a single step. A failure at any point leaves the file that was already there
-  and answers `-ERR` instead. The work happens before the reply, so the server is busy
-  for as long as the rewrite takes.
+  state the store is holding now — one `SET` per live string, an `HSET`, `RPUSH` or
+  `SADD` per live hash, list or set, each keeping the key's absolute deadline as a
+  `PEXPIREAT` and leaving out keys that have expired — forced whole, and then swapped
+  into place in a single step. A failure at any point leaves the file that was already
+  there and answers `-ERR` instead. The work happens before the reply, so the server is
+  busy for as long as the rewrite takes.
 - The rewrite runs under the same lock that records writes, so a write either lands in
   the state the compact file describes or lands in the file the swap left behind; it
   cannot be lost between the two. It is local maintenance: it is not sent to replicas,
@@ -129,10 +135,12 @@ java -jar target/redisforge.jar --maxmemory 268435456 --maxmemory-policy allkeys
 
 - The size of a key is a logical estimate, not the JVM's resident memory: a fixed
   overhead per entry, the UTF-8 bytes of the key and the value, and a few bytes more for
-  a key that carries a deadline. It is stable across runs and platforms, which is what a
-  limit has to be to mean the same thing everywhere. `INFO memory` reports the same
-  number it compares against, so `used_memory` is the quantity `maxmemory` is judged
-  against, not the process's RSS.
+  a key that carries a deadline. A hash, list or set also charges each of its fields,
+  elements or members, with the same overhead per element as the entry itself, so a
+  collection's cost grows with its contents. It is stable across runs and platforms,
+  which is what a limit has to be to mean the same thing everywhere. `INFO memory`
+  reports the same number it compares against, so `used_memory` is the quantity
+  `maxmemory` is judged against, not the process's RSS.
 - A write is judged by the size the keyspace *would* have once it lands: the bytes the
   target key already holds are given back before the new entry is charged. A write that
   fits is admitted with nothing removed.
@@ -151,6 +159,37 @@ java -jar target/redisforge.jar --maxmemory 268435456 --maxmemory-policy allkeys
 - A transaction is admitted as a unit or refused as one. If the state it would commit
   does not fit the ceiling, `EXEC` answers `-OOM` and commits nothing, rather than being
   made to fit by removing keys the queued commands never mentioned.
+
+## Hashes, lists and sets
+
+Every key carries a type: a string, a hash, a list or a set. Exactly one kind is held
+at a key, and a command that names another kind is answered with `-WRONGTYPE Operation
+against a key holding the wrong kind of value` instead of being allowed to reinterpret
+the bytes. `GET` and `INCR` are string commands, so they answer `-WRONGTYPE` against a
+hash, list or set, and the typed reads do the same against a string.
+
+- A hash is a `field -> value` map, a list an ordered sequence of elements, a set a
+  collection of distinct members. All three keep insertion order, and that order is what
+  `HGETALL`, `HKEYS`, `HVALS` and `SMEMBERS` return. It is stable across the whole
+  server, not Redis's own internal ordering, which no client should depend on.
+- `HSET` answers the number of fields it added; setting a field to the value it already
+  held changes nothing. `LPUSH` pushes each argument one by one, so `LPUSH key a b c`
+  leaves the list `[c, b, a]`. `SADD` answers how many members were new; members already
+  present are ignored.
+- Counts and indexes follow Redis: an `LPOP`/`RPOP`/`SPOP` count that is negative is an
+  error while `SRANDMEMBER` accepts it (returning duplicates); zero removes every match
+  for `LREM`; ranges and indexes may be negative and are resolved against the tail;
+  `LRANGE` with `stop` beyond the end stops at the last element.
+- A hash whose last field, a list whose last element or a set whose last member is
+  removed stops existing: the empty collection is not a key.
+- `SPOP` picks members by random. Because a random pop has to mean the same thing on a
+  master, a replica and a replay, it is recorded and propagated as the `SREM` of exactly
+  the members it took; it is never written down as the `SPOP` itself. The reply to the
+  client is still the member or members popped.
+- A typed key takes a deadline like a string: `EXPIRE`, `PEXPIRE` and friends work on a
+  hash, list or set and keep the collection intact. A typed command against an expired
+  or missing key answers the empty form: `:0` for the length and membership counts,
+  `$-1` for a missing single value, and an empty array for a missing whole-key read.
 
 ## Docker
 
@@ -186,7 +225,17 @@ image you published.
 (sections `server`, `replication`, `memory`, `all`), `REPLCONF`, `PSYNC`, `WAIT`,
 `BGREWRITEAOF`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
-`DEL` is only handled inside a transaction.
+Hashes: `HSET`, `HGET`, `HMGET`, `HDEL`, `HEXISTS`, `HLEN`, `HGETALL`, `HKEYS`,
+`HVALS`, `HSETNX`, `HSTRLEN`
+
+Lists: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LREM`,
+`LTRIM`
+
+Sets: `SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS`, `SPOP`,
+`SRANDMEMBER`
+
+`DEL` is only handled inside a transaction. See
+[Hashes, lists and sets](#hashes-lists-and-sets) for the semantics.
 
 `EXPIRE` / `PEXPIRE` answer `:1` when the deadline was set (or the key removed, for a
 non-positive delay) and `:0` when the key does not exist. `TTL` / `PTTL` answer the
@@ -199,11 +248,14 @@ evicting keys by the configured policy or refused with `-OOM`. See
 
 ### Replica
 
-`PING`, `ECHO`, `GET`, `TTL`, `PTTL`, `INFO replication`, `REPLCONF`, `PSYNC`, `WAIT`
+`PING`, `ECHO`, `GET`, `TTL`, `PTTL`, `INFO replication`, `REPLCONF`, `PSYNC`, `WAIT`,
+and every hash, list and set read: `HGET`, `HMGET`, `HLEN`, `HEXISTS`, `HGETALL`,
+`HKEYS`, `HVALS`, `HSTRLEN`, `LLEN`, `LRANGE`, `LINDEX`, `SCARD`, `SISMEMBER`,
+`SMISMEMBER`, `SMEMBERS`, `SRANDMEMBER`
 
-Write commands, including the expiration commands, are rejected with `-READONLY`.
-`BGREWRITEAOF` is recognized but refused with `-ERR no append only file to rewrite`,
-since a replica keeps no file of its own.
+Write commands, including the typed writes and the expiration commands, are rejected
+with `-READONLY`. `BGREWRITEAOF` is recognized but refused with
+`-ERR no append only file to rewrite`, since a replica keeps no file of its own.
 
 ## Errors and protocol limits
 
@@ -276,8 +328,9 @@ since a replica keeps no file of its own.
   or a position that does not parse, is answered with a full resync, which is always safe
   because the replica takes on whatever position the master's stream has reached. A full
   resync ships the master's current dataset behind the `+FULLRESYNC` line, so the replica
-  replaces its keyspace with the master's live keys, keeping each key's remaining
-  deadline, and the stream that follows keeps it in step from there.
+  replaces its keyspace with the master's live keys, keeping each key's type and its
+  remaining deadline, and the stream that follows keeps it in step from there. An older
+  string-only snapshot is still accepted and installed as the strings it holds.
 - No failover: a master that goes away is not replaced, and there is no Sentinel or
   Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.

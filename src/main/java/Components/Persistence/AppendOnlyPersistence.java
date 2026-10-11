@@ -21,6 +21,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -294,13 +295,62 @@ public class AppendOnlyPersistence {
                 continue;
             }
             Long deadline = absoluteExpiryMillis(value);
-            if (deadline == null) {
-                snapshot.add(new String[]{"SET", key, value.val});
-            } else {
-                snapshot.add(new String[]{"SET", key, value.val, "PXAT", String.valueOf(deadline)});
+            if (value.kind == Value.Kind.STRING) {
+                if (deadline == null) {
+                    snapshot.add(new String[]{"SET", key, value.val});
+                } else {
+                    snapshot.add(new String[]{"SET", key, value.val, "PXAT", String.valueOf(deadline)});
+                }
+                continue;
+            }
+            snapshot.add(rebuildFrame(key, value));
+            if (deadline != null) {
+                // the deadline rides as an absolute PEXPIREAT, so a file replayed later
+                // still expires the key at the instant the master would have
+                snapshot.add(new String[]{"PEXPIREAT", key, String.valueOf(deadline)});
             }
         }
         return snapshot;
+    }
+
+    /**
+     * The one frame that rebuilds a hash, list or set from empty: the same commands a
+     * client would have sent to construct it, in the order the store keeps.
+     */
+    private static String[] rebuildFrame(String key, Value value) {
+        switch (value.kind) {
+            case HASH -> {
+                String[] frame = new String[2 + value.hash.size() * 2];
+                frame[0] = "HSET";
+                frame[1] = key;
+                int i = 2;
+                for (Map.Entry<String, String> field : value.hash.entrySet()) {
+                    frame[i++] = field.getKey();
+                    frame[i++] = field.getValue();
+                }
+                return frame;
+            }
+            case LIST -> {
+                String[] frame = new String[2 + value.list.size()];
+                frame[0] = "RPUSH";
+                frame[1] = key;
+                int i = 2;
+                for (String element : value.list) {
+                    frame[i++] = element;
+                }
+                return frame;
+            }
+            default -> {
+                String[] frame = new String[2 + value.set.size()];
+                frame[0] = "SADD";
+                frame[1] = key;
+                int i = 2;
+                for (String member : value.set) {
+                    frame[i++] = member;
+                }
+                return frame;
+            }
+        }
     }
 
     /** Deletes the temp file a failed rewrite left behind, keeping the original failure. */
@@ -332,7 +382,10 @@ public class AppendOnlyPersistence {
         }
         return switch (command[0].toUpperCase()) {
             case "SET", "INCR", "DEL",
-                 "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST" -> true;
+                 "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST",
+                 "HSET", "HDEL", "HSETNX",
+                 "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
+                 "SADD", "SREM" -> true;
             default -> false;
         };
     }
@@ -473,7 +526,10 @@ public class AppendOnlyPersistence {
                     replayTransaction(queued);
                     queued = null;
                 }
-                case "SET", "INCR", "DEL", "PEXPIREAT", "PERSIST" -> {
+                case "SET", "INCR", "DEL", "PEXPIREAT", "PERSIST",
+                     "HSET", "HDEL", "HSETNX",
+                     "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
+                     "SADD", "SREM" -> {
                     if (queued == null) {
                         replayCommand(frame);
                     } else {
@@ -531,6 +587,12 @@ public class AppendOnlyPersistence {
             case "PERSIST" -> {
                 requireArity(command, 2);
                 store.persist(command[1]);
+            }
+            case "HSET", "HDEL", "HSETNX",
+                 "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
+                 "SADD", "SREM" -> {
+                requireArity(command, 2);
+                store.applyTypedFromLog(command);
             }
             default -> throw corrupt("unknown command '" + command[0] + "'");
         }

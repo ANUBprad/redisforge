@@ -128,7 +128,7 @@ public class MemoryManager {
             Value value = entry.getValue();
             long previous = store.entryBytes(key);
             long next = value.isDeletedInTransaction ? 0
-                    : MemoryEstimator.entryBytes(key, value.val, value.expiry);
+                    : MemoryEstimator.entryBytes(key, value);
             projected += next - previous;
         }
         return projected <= max ? null : OOM_ERROR;

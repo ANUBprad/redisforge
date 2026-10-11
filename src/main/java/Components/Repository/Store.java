@@ -125,9 +125,9 @@ public class Store {
         return value == null ? 0 : bytesOf(key, value);
     }
 
-    /** The logical bytes of one concrete entry. */
+    /** The logical bytes of one concrete entry, whatever kind it holds. */
     private long bytesOf(String key, Value value) {
-        return MemoryEstimator.entryBytes(key, value.val, value.expiry);
+        return MemoryEstimator.entryBytes(key, value);
     }
 
     /** Records that a key was used, at the next step of the access sequence. */
@@ -255,6 +255,10 @@ public class Store {
                 touch(created);
                 return respSerializer.respInteger(1);
             }
+            if (current.kind != Value.Kind.STRING) {
+                // INCR counts a string: anything else is the wrong type
+                return TypedOps.WRONGTYPE;
+            }
             int incremented;
             try {
                 incremented = Integer.parseInt(current.val) + 1;
@@ -289,6 +293,10 @@ public class Store {
                 }
                 return "$-1\r\n";
             }
+            if (value.kind != Value.Kind.STRING) {
+                // GET names one kind: a hash, list or set is not it
+                return TypedOps.WRONGTYPE;
+            }
             touch(value);
             return respSerializer.serializeBulkString(value.val);
         } catch (Exception e) {
@@ -318,6 +326,102 @@ public class Store {
             return null;
         }finally{
             rwLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * A private deep copy of a key's value, or {@code null} when the key is absent or has
+     * expired. The copy is what a typed command is applied to, so the store is not touched
+     * until the caller commits the result.
+     */
+    public Value valueCopy(String key) {
+        rwLock.readLock().lock();
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            Value value = map.get(key);
+            if (value != null && value.expiry.isBefore(now)) {
+                if (map.remove(key, value)) {
+                    datasetBytes.addAndGet(-bytesOf(key, value));
+                }
+                return null;
+            }
+            if (value == null) {
+                return null;
+            }
+            touch(value);
+            return value.copy();
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Reads a key under the read lock and answers from it. The reader sees the entry the
+     * store holds at that instant, so a collection cannot be read while a writer is
+     * halfway through changing it. A key that is absent, or whose deadline has passed, is
+     * handed to the reader as {@code null}.
+     */
+    public String read(String key, Function<Value, String> reader) {
+        rwLock.readLock().lock();
+        try {
+            LocalDateTime now = LocalDateTime.now();
+            Value value = map.get(key);
+            if (value != null && value.expiry.isBefore(now)) {
+                if (map.remove(key, value)) {
+                    datasetBytes.addAndGet(-bytesOf(key, value));
+                }
+                value = null;
+            }
+            if (value != null) {
+                touch(value);
+            }
+            return reader.apply(value);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Puts the value a typed command produced, or removes the key when that value is
+     * {@code null}: a hash, list or set that ran out of fields, elements or members is
+     * not a key any more. The bytes are re-counted against whatever the key held before.
+     */
+    public void commit(String key, Value value) {
+        if (value == null) {
+            delete(key);
+            return;
+        }
+        ReentrantLock keyLock = lockFor(key);
+        keyLock.lock();
+        try {
+            rwLock.writeLock().lock();
+            try {
+                Value previous = map.put(key, value);
+                datasetBytes.addAndGet(bytesOf(key, value) - (previous == null ? 0 : bytesOf(key, previous)));
+                touch(value);
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        } finally {
+            keyLock.unlock();
+        }
+    }
+
+    /**
+     * Applies one typed command exactly as it was recorded, for a replayed append only
+     * file and a replica taking its master's stream. No admission runs here, because a
+     * replica and a replay must never make an eviction decision of their own - that would
+     * let them drop a key their master still holds.
+     */
+    public void applyTypedFromLog(String[] command) {
+        if (command.length < 2) {
+            return;
+        }
+        String key = command[1];
+        Value current = valueCopy(key);
+        TypedOps.Mutation mutation = TypedOps.mutate(command, current);
+        if (mutation.changed()) {
+            commit(key, mutation.value());
         }
     }
 
@@ -426,7 +530,10 @@ public class Store {
                     }
                     return 1;
                 }
-                Value successor = new Value(value.val, value.created, exp);
+                // a new deadline on a hash, list or set must keep the kind and its contents:
+                // rebuilding the entry as a string would throw the collection away
+                Value successor = value.copy();
+                successor.expiry = exp;
                 map.put(key, successor);
                 datasetBytes.addAndGet(bytesOf(key, successor) - bytesOf(key, value));
                 touch(successor);
@@ -455,7 +562,9 @@ public class Store {
                     return 0;
                 }
                 if (value.expiry.equals(LocalDateTime.MAX)) return 0;
-                Value successor = new Value(value.val, value.created, LocalDateTime.MAX);
+                // clearing the deadline must not change what the key holds
+                Value successor = value.copy();
+                successor.expiry = LocalDateTime.MAX;
                 map.put(key, successor);
                 datasetBytes.addAndGet(bytesOf(key, successor) - bytesOf(key, value));
                 touch(successor);
@@ -551,6 +660,108 @@ public class Store {
         } finally {
             rwLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * The live keys as typed snapshot entries, captured under the read lock at one
+     * instant. This is the full-resync counterpart of {@link #liveSnapshot()}: it carries
+     * every kind, not only strings, so a replica that syncs from a master holding hashes,
+     * lists and sets gets them back with their types.
+     */
+    public List<StoreSnapshot.TypedEntry> liveTypedSnapshot() {
+        LocalDateTime now = LocalDateTime.now();
+        List<StoreSnapshot.TypedEntry> entries = new ArrayList<>();
+        rwLock.readLock().lock();
+        try {
+            for (Map.Entry<String, Value> entry : map.entrySet()) {
+                Value value = entry.getValue();
+                if (value == null || value.expiry.isBefore(now)) continue;
+                entries.add(typedEntry(entry.getKey(), value, absoluteExpiryMillis(value)));
+            }
+        } finally {
+            rwLock.readLock().unlock();
+        }
+        entries.sort(Comparator.comparing(StoreSnapshot.TypedEntry::key));
+        return entries;
+    }
+
+    /** One live value as the typed entry a full resync hands over. */
+    private static StoreSnapshot.TypedEntry typedEntry(String key, Value value, Long deadline) {
+        StoreSnapshot.Kind kind = switch (value.kind) {
+            case STRING -> StoreSnapshot.Kind.STRING;
+            case HASH -> StoreSnapshot.Kind.HASH;
+            case LIST -> StoreSnapshot.Kind.LIST;
+            case SET -> StoreSnapshot.Kind.SET;
+        };
+        List<String> content = new ArrayList<>();
+        switch (value.kind) {
+            case STRING -> content.add(value.val);
+            case HASH -> {
+                for (Map.Entry<String, String> field : value.hash.entrySet()) {
+                    content.add(field.getKey());
+                    content.add(field.getValue());
+                }
+            }
+            case LIST -> content.addAll(value.list);
+            case SET -> content.addAll(value.set);
+        }
+        return new StoreSnapshot.TypedEntry(key, kind, content, deadline);
+    }
+
+    /**
+     * Replaces the whole contents of the store with the typed entries a full resync
+     * carried, rebuilding each kind and dropping any whose deadline has already passed.
+     */
+    public void installTypedSnapshot(List<StoreSnapshot.TypedEntry> entries) {
+        LocalDateTime now = LocalDateTime.now();
+        ConcurrentHashMap<String, Value> fresh = new ConcurrentHashMap<>(
+                Math.max(16, entries.size() * 2));
+        long bytes = 0;
+        for (StoreSnapshot.TypedEntry entry : entries) {
+            Value value = valueFromTyped(entry, now);
+            if (value == null) continue;
+            fresh.put(entry.key(), value);
+            bytes += bytesOf(entry.key(), value);
+        }
+        rwLock.writeLock().lock();
+        try {
+            this.map = fresh;
+            datasetBytes.set(bytes);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    private static Value valueFromTyped(StoreSnapshot.TypedEntry entry, LocalDateTime now) {
+        LocalDateTime expiry = LocalDateTime.MAX;
+        if (entry.deadlineEpochMillis() != null) {
+            expiry = LocalDateTime.ofInstant(
+                    Instant.ofEpochMilli(entry.deadlineEpochMillis()), ZoneId.systemDefault());
+            if (expiry.isBefore(now)) {
+                return null;
+            }
+        }
+        List<String> content = entry.content();
+        return switch (entry.kind()) {
+            case STRING -> new Value(content.isEmpty() ? "" : content.get(0), now, expiry);
+            case HASH -> {
+                Value value = Value.hash(now, expiry);
+                for (int i = 0; i + 1 < content.size(); i += 2) {
+                    value.hash.put(content.get(i), content.get(i + 1));
+                }
+                yield value;
+            }
+            case LIST -> {
+                Value value = Value.list(now, expiry);
+                value.list.addAll(content);
+                yield value;
+            }
+            case SET -> {
+                Value value = Value.set(now, expiry);
+                value.set.addAll(content);
+                yield value;
+            }
+        };
     }
 
     public void removeExpired() {

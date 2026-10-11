@@ -6,6 +6,7 @@ import Components.Infra.ReplicationBacklog;
 import Components.Infra.Slave;
 import Components.Infra.StoreSnapshot;
 import Components.Repository.Store;
+import Components.Repository.TypedOps;
 import Components.Repository.Value;
 import Components.Server.RedisConfig;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -107,6 +108,18 @@ public class CommandHandler {
             return wrongNumberOfArguments("get");
         }
         return store.get(command[1]);
+    }
+
+    /**
+     * Answers a hash, list or set read. Every typed read names its key first, so a missing
+     * key is the wrong number of arguments; the read itself runs under the store's read
+     * lock, so a collection cannot be read while a writer is changing it.
+     */
+    public String typedRead(String[] command) {
+        if (command.length < 2) {
+            return wrongNumberOfArguments(command[0].toLowerCase(Locale.ROOT));
+        }
+        return store.read(command[1], value -> TypedOps.read(command, value));
     }
 
     public String expire(String[] command) {
@@ -432,7 +445,7 @@ public class CommandHandler {
         synchronized (backlog) {
             replicationId = redisConfig.getMasterReplId();
             replicationOffset = redisConfig.getMasterReplOffset();
-            snapshot = StoreSnapshot.serialize(store.liveSnapshot());
+            snapshot = StoreSnapshot.serializeDataset(store.liveTypedSnapshot());
         }
 
         String res = "+FULLRESYNC " + replicationId + " " + replicationOffset + "\r\n";
@@ -539,11 +552,31 @@ public class CommandHandler {
     }
 
     public BiFunction<String[], Map<String, Value>, String> getTransactionCommandCacheApplier(){
+        return getTransactionCommandCacheApplier(null);
+    }
+
+    /**
+     * The applier a queued transaction is run through. When the applying client is known,
+     * a typed mutation records the frame it must be written down and passed on as - which
+     * matters for {@code SPOP}, whose popped members are only known at apply time - so the
+     * transaction can be persisted and replicated deterministically.
+     */
+    public BiFunction<String[], Map<String, Value>, String> getTransactionCommandCacheApplier(Client client){
         final Store localStore = this.store;
         final RespSerializer localSerializer = this.respSerializer;
         return (String[] command, Map<String, Value> map)->{
+            String name = command[0].toUpperCase(Locale.ROOT);
+            if (TypedOps.handles(name)) {
+                if (TypedOps.isRead(name)) {
+                    Value current = command.length >= 2
+                            ? resolveTransactionalValue(command[1], map, localStore)
+                            : null;
+                    return TypedOps.read(command, current);
+                }
+                return applyTypedTransactional(command, map, localStore, client);
+            }
             String res = "";
-            switch (command[0].toUpperCase(Locale.ROOT)) {
+            switch (name) {
                 case "SET":
                     res = handleSetCommandTransactional(command, map, localSerializer, localStore);
                     break;
@@ -600,9 +633,41 @@ public class CommandHandler {
         if (storeValue == null) {
             return null;
         }
-        Value copy = new Value(storeValue.val, storeValue.created, storeValue.expiry);
+        Value copy = storeValue.copy();
         map.put(key, copy);
         return copy;
+    }
+
+    /**
+     * A queued hash, list or set write, applied to the transaction's view of the key. The
+     * mutation is computed against a copy and stored into the view, so EXEC commits it
+     * with the rest only if the whole transaction is admitted. A mutation that empties a
+     * collection marks the key for deletion at commit time.
+     */
+    private String applyTypedTransactional(String[] command, Map<String, Value> map,
+                                           Store localStore, Client client) {
+        if (command.length < 2) {
+            return wrongNumberOfArguments(command[0].toLowerCase(Locale.ROOT));
+        }
+        String key = command[1];
+        Value current = resolveTransactionalValue(key, map, localStore);
+        TypedOps.Mutation mutation = TypedOps.mutate(command, current);
+        if (mutation.reply().startsWith("-") || !mutation.changed()) {
+            return mutation.reply();
+        }
+        if (mutation.value() == null) {
+            Value tombstone = current != null
+                    ? current
+                    : new Value("", LocalDateTime.now(), LocalDateTime.MAX);
+            tombstone.isDeletedInTransaction = true;
+            map.put(key, tombstone);
+        } else {
+            map.put(key, mutation.value());
+        }
+        if (client != null && mutation.propagation() != null) {
+            client.transactionPropagation.put(command, mutation.propagation());
+        }
+        return mutation.reply();
     }
 
     /**
@@ -685,7 +750,7 @@ public class CommandHandler {
                 //both are null
                 return "-ERR deleting and invalid key\r\n";
             }else{
-                valueToUse = new Value(storeValue.val, storeValue.created, storeValue.expiry);
+                valueToUse = storeValue.copy();
             }
         }else{
             valueToUse = cachedValue;
@@ -712,10 +777,13 @@ public class CommandHandler {
                 if(storeValue==null) {
                     valueToUse = new Value("0", LocalDateTime.now(), LocalDateTime.MAX);
                 }else{
-                    valueToUse = new Value(storeValue.val, storeValue.created, storeValue.expiry);
+                    valueToUse = storeValue.copy();
                 }
             }else{
                 valueToUse=cachedValue;
+            }
+            if (valueToUse.kind != Value.Kind.STRING) {
+                return TypedOps.WRONGTYPE;
             }
             int val = Integer.parseInt(valueToUse.val);
             val++;
@@ -743,11 +811,14 @@ public class CommandHandler {
                 //both are null
                 return localStore.get(key);
             }else{
-                valueToUse = new Value(storeValue.val, storeValue.created, storeValue.expiry);
+                valueToUse = storeValue.copy();
                 map.put(key, valueToUse);
             }
         }else{
             valueToUse = cachedValue;
+        }
+        if (valueToUse.kind != Value.Kind.STRING) {
+            return TypedOps.WRONGTYPE;
         }
         return respSerializer.serializeBulkString(valueToUse.val);
     }

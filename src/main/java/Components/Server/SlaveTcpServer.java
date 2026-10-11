@@ -3,6 +3,7 @@ package Components.Server;
 import Components.Infra.ConnectionPool;
 import Components.Infra.Slave;
 import Components.Repository.Store;
+import Components.Repository.TypedOps;
 import Components.Service.CommandHandler;
 import Components.Service.RespSerializer;
 import Components.Infra.Client;
@@ -330,12 +331,12 @@ public class SlaveTcpServer {
 
         // a snapshot that cannot be decoded is refused whole, just like one that never
         // arrived: the next attempt hands the attachment over again
-        List<StoreSnapshot.Entry> entries = StoreSnapshot.parse(snapshot);
+        List<StoreSnapshot.TypedEntry> entries = StoreSnapshot.parseDataset(snapshot);
         // the install swaps in a fresh map, and the swap is excluded from a downstream
         // resync that might be serializing this store at the same moment, under the same
         // backlog lock that resync would take
         synchronized (redisConfig.getReplicationBacklog()) {
-            store.installSnapshot(entries);
+            store.installTypedSnapshot(entries);
         }
 
         // the position is taken only once the dataset behind it has arrived whole: half a
@@ -391,6 +392,17 @@ public class SlaveTcpServer {
             case "INCR":
                 applyFromMaster(() -> {
                     commandHandler.incr(command);
+                    passOn(command);
+                });
+                break;
+            case "HSET", "HDEL", "HSETNX",
+                 "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM",
+                 "SADD", "SREM":
+                // a typed write the master made, applied with the same rules it was made
+                // by - and never evicted here: the master's decision already travelled as
+                // the DELs it sent
+                applyFromMaster(() -> {
+                    store.applyTypedFromLog(command);
                     passOn(command);
                 });
                 break;
@@ -651,7 +663,16 @@ public class SlaveTcpServer {
                 res = "-ERR no append only file to rewrite\r\n";
                 break;
             default:
-                res = "-ERR unknown command '" + command[0] + "'\r\n";
+                String name = command[0].toUpperCase(Locale.ROOT);
+                if (TypedOps.handles(name)) {
+                    // a hash, list or set read is served here; a write is refused like any
+                    // other write, because a replica takes its changes from its master
+                    res = TypedOps.isRead(name)
+                            ? commandHandler.typedRead(command)
+                            : "-READONLY You can't write against a replica.\r\n";
+                } else {
+                    res = "-ERR unknown command '" + command[0] + "'\r\n";
+                }
                 break;
         }
         client.send(res, data);

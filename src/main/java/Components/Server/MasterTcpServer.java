@@ -142,9 +142,9 @@ public class MasterTcpServer {
     private void handleCommand(String[] command, Client client) throws IOException {
         if(!client.getTransactionalContext()){
             ResponseDto responseDto = caseHandler(command, client);
-            // null means the command answered the socket itself: PSYNC writes both of its
-            // answers while the backlog is held, and writing one anywhere else would let a
-            // write overtake it or land ahead of the bytes it follows
+            // null means the command answered the socket itself: PSYNC writes its own
+            // answer, and writing one anywhere else would let a write overtake it or land
+            // ahead of the bytes it follows
             if(responseDto != null){
                 client.send(responseDto);
             }
@@ -176,22 +176,29 @@ public class MasterTcpServer {
 
                 //execute the transaction
                 BiFunction<String[], Map<String, Value>, String> transactionCacheApplier = commandHandler.getTransactionCommandCacheApplier();
-                // the whole transaction is recorded under one hold of the file lock, right
-                // after the store applied it, so it lands in the file as one block and in
-                // the same order the store was changed in
-                appendOnlyPersistence.locked(() -> {
-                    store.executeTransaction(client, transactionCacheApplier);
-                    appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
-                    return null;
-                });
+                // the backlog lock is held across the store apply and the propagation of
+                // every command, so a full resync that cuts its snapshot in the middle of
+                // a transaction can never serialize a store whose writes are only half
+                // counted into the stream, and the file lock is taken inside it, in the
+                // order a single command takes them
+                synchronized (redisConfig.getReplicationBacklog()) {
+                    // the whole transaction is recorded under one hold of the file lock, right
+                    // after the store applied it, so it lands in the file as one block and in
+                    // the same order the store was changed in
+                    appendOnlyPersistence.locked(() -> {
+                        store.executeTransaction(client, transactionCacheApplier);
+                        appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
+                        return null;
+                    });
 
-                client.endTransaction();
-                while(!commands.isEmpty()){
-                    // each command is counted and sent as one step, so a replica that asks
-                    // to carry on between two of them is resumed at a whole frame. An
-                    // expiration is sent in its absolute form, so a replica expiring the
-                    // key does not start the clock over on its own.
-                    propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
+                    client.endTransaction();
+                    while(!commands.isEmpty()){
+                        // each command is counted and sent as one step, so a replica that asks
+                        // to carry on between two of them is resumed at a whole frame. An
+                        // expiration is sent in its absolute form, so a replica expiring the
+                        // key does not start the clock over on its own.
+                        propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
+                    }
                 }
 
                 String response = respSerializer.respArray(client.transactionResponse);
@@ -278,44 +285,50 @@ public class MasterTcpServer {
                     res = commandHandler.wrongNumberOfArguments("incr");
                     break;
                 }
-                // the file lock comes first and the key's lock inside it, which is the
-                // order a transaction takes them: applied, recorded and propagated under
-                // both, so replicas see the increments of a key in the order this master
-                // applied them, and an increment can never end up waiting for the file
-                // while a transaction holds it and waits for the key
-                res = appendOnlyPersistence.locked(() -> {
-                    ReentrantLock keyLock = store.lockFor(command[1]);
-                    keyLock.lock();
-                    try {
-                        String increment = commandHandler.incr(command);
-                        // an increment that was refused is not a mutation, so it is neither
-                        // written to the file nor replicated
-                        if (!increment.startsWith("-")) {
-                            appendOnlyPersistence.appendApplied(command);
-                            propagate(command);
+                // the backlog lock comes first, the file lock inside it and the key's lock
+                // inside that: applied, recorded and propagated under one hold of the
+                // backlog, so a full resync that serializes the store between commands
+                // never counts an increment that is not visible yet or the other way round
+                synchronized (redisConfig.getReplicationBacklog()) {
+                    res = appendOnlyPersistence.locked(() -> {
+                        ReentrantLock keyLock = store.lockFor(command[1]);
+                        keyLock.lock();
+                        try {
+                            String increment = commandHandler.incr(command);
+                            // an increment that was refused is not a mutation, so it is neither
+                            // written to the file nor replicated
+                            if (!increment.startsWith("-")) {
+                                appendOnlyPersistence.appendApplied(command);
+                                propagate(command);
+                            }
+                            return increment;
+                        } finally {
+                            keyLock.unlock();
                         }
-                        return increment;
-                    } finally {
-                        keyLock.unlock();
-                    }
-                });
+                    });
+                }
                 break;
             }
             case "ECHO":
                 res = commandHandler.echo(command);
                 break;
             case "SET":
-                res = appendOnlyPersistence.locked(() -> {
-                    String set = commandHandler.set(command);
-                    if (set.startsWith("+")) {
-                        // the store has the deadline the command asked for, so the entry
-                        // can be written with an absolute one
-                        appendOnlyPersistence.appendApplied(command);
-                    }
-                    // on this thread, so replicas receive writes in the order they arrived
-                    propagate(command);
-                    return set;
-                });
+                // one hold of the backlog lock around apply, record and propagate, for the
+                // same reason an increment takes one: the store and the stream cannot come
+                // apart in the middle of a full resync. The file lock is taken inside it.
+                synchronized (redisConfig.getReplicationBacklog()) {
+                    res = appendOnlyPersistence.locked(() -> {
+                        String set = commandHandler.set(command);
+                        if (set.startsWith("+")) {
+                            // the store has the deadline the command asked for, so the entry
+                            // can be written with an absolute one
+                            appendOnlyPersistence.appendApplied(command);
+                        }
+                        // on this thread, so replicas receive writes in the order they arrived
+                        propagate(command);
+                        return set;
+                    });
+                }
                 break;
             case "GET":
                 res = commandHandler.get(command);
@@ -351,8 +364,8 @@ public class MasterTcpServer {
                 res = commandHandler.wait(command);
                 break;
             case "PSYNC":
-                // both answers are written by the handler itself while the backlog is held,
-                // so null means the socket already has its reply
+                // both answers are written by the handler itself, so null means the socket
+                // already has its reply
                 ResponseDto resDto = commandHandler.psync(command, client);
                 if(resDto == null){
                     return null;
@@ -403,14 +416,19 @@ public class MasterTcpServer {
      * absolute one, so replicas and the file expire the key at the same instant.
      */
     private String applyExpiration(String[] command, Supplier<String> action) {
-        return appendOnlyPersistence.locked(() -> {
-            String applied = action.get();
-            if (applied.equals(":1\r\n")) {
-                appendOnlyPersistence.appendApplied(command);
-                propagate(appendOnlyPersistence.replicationFrame(command));
-            }
-            return applied;
-        });
+        // the backlog lock makes the store change, its recording and its propagation one
+        // step, so a full resync serialized in the middle cannot part the keyspace from
+        // the stream that follows it
+        synchronized (redisConfig.getReplicationBacklog()) {
+            return appendOnlyPersistence.locked(() -> {
+                String applied = action.get();
+                if (applied.equals(":1\r\n")) {
+                    appendOnlyPersistence.appendApplied(command);
+                    propagate(appendOnlyPersistence.replicationFrame(command));
+                }
+                return applied;
+            });
+        }
     }
 
     private void propagate(String[] command) {
@@ -418,9 +436,10 @@ public class MasterTcpServer {
         // the same bytes the replicas are sent, so the offset counts what went over the wire
         byte[] propagated = commandRespString.getBytes(StandardCharsets.UTF_8);
         // one hold of the backlog's lock, because counting the bytes, keeping them and
-        // sending them is one step: a replica that asks to resume in between would
-        // otherwise be told a position whose bytes were counted but never sent, and would
-        // carry on from a stream with a hole in it
+        // queueing them is one step: a replica that asks to resume in between would
+        // otherwise be told a position whose bytes were counted but never queued, and would
+        // carry on from a stream with a hole in it. The frames are only queued under the
+        // lock; each replica's own sender thread writes its socket outside it
         synchronized (redisConfig.getReplicationBacklog()) {
             redisConfig.recordReplicatedBytes(propagated);
             // a copy, because a replica that cannot be written to is dropped on the way past

@@ -132,7 +132,9 @@ public class ConnectionPool {
         for(Slave slave: new ArrayList<>(slaves)){
             slaves.remove(slave);
             slave.clearAcknowledgement();
-            slave.connection.close();
+            // closing stops the sender thread as well, so a dropped replica leaves nothing
+            // writing behind it
+            slave.close();
         }
         slavesThatAreCaughtUp.set(0);
     }
@@ -152,7 +154,14 @@ public class ConnectionPool {
     }
 
     public boolean removeSlave(Slave slave){
-        return slaves.remove(slave);
+        if(slave == null){
+            return false;
+        }
+        boolean removed = slaves.remove(slave);
+        // dropping a replica means its socket and sender thread go with it: a registration
+        // that is no longer in the pool must not leave a connection to it alive
+        slave.close();
+        return removed;
     }
 
     public boolean removeSlave(Client client){
@@ -163,7 +172,7 @@ public class ConnectionPool {
             return false;
         }
 
-        return slaves.remove(slaveToRemove);
+        return removeSlave(slaveToRemove);
     }
 
     /**
@@ -176,7 +185,8 @@ public class ConnectionPool {
             client.close();
         }
         for (Slave slave : new ArrayList<>(slaves)) {
-            slave.connection.close();
+            // closes the socket and the sender thread together, so no writer is left behind
+            slave.close();
         }
         clients.clear();
         slaves.clear();

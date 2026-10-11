@@ -7,6 +7,8 @@ import Components.Service.CommandHandler;
 import Components.Service.RespSerializer;
 import Components.Infra.Client;
 import Components.Infra.RespStream;
+import Components.Infra.Slave;
+import Components.Infra.StoreSnapshot;
 import Components.Service.ResponseDto;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -230,8 +233,8 @@ public class SlaveTcpServer {
     }
 
     /**
-     * Applies the commands the master streams down once the RDB payload is out of the way.
-     * The upstream is framed exactly the way a client's is: only whole RESP arrays are
+     * Applies the commands the master streams down once the dataset snapshot is out of the
+     * way. The upstream is framed exactly the way a client's is: only whole RESP arrays are
      * decoded, in arrival order, and a partly received array waits for the rest of it
      * instead of being read as if the socket had ended a message there.
      */
@@ -266,8 +269,11 @@ public class SlaveTcpServer {
      * <p>A "+CONTINUE" means the master still holds this replica's stream: no dataset
      * arrives, no position is taken over, nothing below is let go of, and the writes that
      * follow pick up exactly where this replica stopped, because the bytes in between were
-     * written with the answer. Anything else is a "+FULLRESYNC" and the RDB behind it, which
-     * is where a new position is taken.</p>
+     * written with the answer. Anything else is a "+FULLRESYNC" and the dataset behind it,
+     * which is where a new position is taken. The dataset is decoded and installed here,
+     * before the position is taken, so a snapshot that is not one - cut short, spliced, or
+     * of a version this replica does not understand - fails the whole attachment, and the
+     * next attempt starts from a new socket instead of carrying a bad dataset around.</p>
      */
     private void readPsyncReply(InputStream inputStream) throws IOException {
         String status = readLine(inputStream);
@@ -305,21 +311,31 @@ public class SlaveTcpServer {
 
         String header = readLine(inputStream);
         if(header == null || !header.startsWith("$")){
-            throw new IOException("expected the length of the RDB but read: " + header);
+            throw new IOException("expected the length of the dataset but read: " + header);
         }
-        int rdbLength;
+        int snapshotLength;
         try {
-            rdbLength = Integer.parseInt(header.substring(1));
+            snapshotLength = Integer.parseInt(header.substring(1));
         } catch (NumberFormatException notALength) {
             throw new IOException("the dataset did not declare a length: " + header);
         }
 
-        // the RDB is raw bytes, so it is counted off rather than scanned for a delimiter.
-        // This master sends no CRLF after the payload, so the first replicated command
-        // picks up on the very next byte
-        byte[] rdb = inputStream.readNBytes(rdbLength);
-        if(rdb.length != rdbLength){
-            throw new EOFException("the RDB ended after " + rdb.length + " of " + rdbLength + " bytes");
+        // the dataset is raw bytes, so it is counted off rather than scanned for a delimiter.
+        // This master sends no CRLF after the payload, so the first replicated command picks
+        // up on the very next byte
+        byte[] snapshot = inputStream.readNBytes(snapshotLength);
+        if(snapshot.length != snapshotLength){
+            throw new EOFException("the dataset ended after " + snapshot.length + " of " + snapshotLength + " bytes");
+        }
+
+        // a snapshot that cannot be decoded is refused whole, just like one that never
+        // arrived: the next attempt hands the attachment over again
+        List<StoreSnapshot.Entry> entries = StoreSnapshot.parse(snapshot);
+        // the install swaps in a fresh map, and the swap is excluded from a downstream
+        // resync that might be serializing this store at the same moment, under the same
+        // backlog lock that resync would take
+        synchronized (redisConfig.getReplicationBacklog()) {
+            store.installSnapshot(entries);
         }
 
         // the position is taken only once the dataset behind it has arrived whole: half a
@@ -364,24 +380,31 @@ public class SlaveTcpServer {
         String res = "";
         switch (cmd){
             case "SET":
-                commandHandler.set(command);
-                passOn(command);
+                // the store change and the pass-on are one step under the backlog's lock,
+                // like an apply below, so a resync of a downstream replica that serializes
+                // this store can never part its keyspace from the stream that follows it
+                applyFromMaster(() -> {
+                    commandHandler.set(command);
+                    passOn(command);
+                });
                 break;
             case "INCR":
-                commandHandler.incr(command);
-                passOn(command);
+                applyFromMaster(() -> {
+                    commandHandler.incr(command);
+                    passOn(command);
+                });
                 break;
             case "DEL":
-                applyDeleteFromMaster(command);
+                applyFromMaster(() -> applyDeleteFromMaster(command));
                 break;
             case "PEXPIREAT":
-                applyExpireAtFromMaster(command);
+                applyFromMaster(() -> applyExpireAtFromMaster(command));
                 break;
             case "PERSIST":
-                applyPersistFromMaster(command);
+                applyFromMaster(() -> applyPersistFromMaster(command));
                 break;
             case "EXPIRE", "PEXPIRE", "EXPIREAT":
-                applyRelativeExpireFromMaster(command);
+                applyFromMaster(() -> applyRelativeExpireFromMaster(command));
                 break;
             case "TTL", "PTTL":
                 // read-only: nothing to apply, but the command still travels down the
@@ -393,6 +416,19 @@ public class SlaveTcpServer {
                 break;
         }
         return res;
+    }
+
+    /**
+     * Applies one replicated write with the change and its pass-on as a single step, held
+     * on the backlog's lock. The master made the write and counted it at once - this hop
+     * must not let a full resync of a replica below serialize a store that already applied
+     * the write but has not walked it down the chain, or the other way round - yet the lock
+     * is reentrant, so the pass-on that follows acquires it again without anything waiting.
+     */
+    private void applyFromMaster(Runnable apply) {
+        synchronized (redisConfig.getReplicationBacklog()) {
+            apply.run();
+        }
     }
 
     /**
@@ -492,8 +528,10 @@ public class SlaveTcpServer {
         // a copy, because a replica that cannot be written to is dropped on the way past
         byte[] propagated = replicatedBytes(command);
         // one hold of the backlog's lock: what this hop counts, what it keeps for a replica
-        // to resume from and what it sends are one step, so a replica below can never be
-        // offered a position whose bytes were counted here but not yet passed on
+        // to resume from and what it queues are one step, so a replica below can never be
+        // offered a position whose bytes were counted here but not yet passed on. The frames
+        // are only queued under the lock; each replica's own sender thread writes its socket
+        // outside it, so a stalled replica cannot hold this lock
         synchronized (redisConfig.getReplicationBacklog()) {
             redisConfig.recordReplicatedBytes(propagated);
             for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
@@ -585,8 +623,8 @@ public class SlaveTcpServer {
                 res = commandHandler.info(command);
                 break;
             case "PSYNC":
-                // both answers are written by the handler itself while the backlog is held,
-                // so null means the socket already has its reply
+                // both answers are written by the handler itself, so null means the socket
+                // already has its reply
                 ResponseDto resDto = commandHandler.psync(command, client);
                 if(resDto == null){
                     return;

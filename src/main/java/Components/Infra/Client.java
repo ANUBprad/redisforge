@@ -21,6 +21,18 @@ public class Client {
     public Queue<String[]> commandQueue;
     public List<String> transactionResponse; // the strings will be in resp format we just need to make a resp array out of it
 
+    /**
+     * The replica this connection registered as, if it did. Set once when the connection
+     * gives its listening port, and read by whichever thread is propagating at that moment,
+     * hence volatile.
+     *
+     * <p>Once set, every frame for this connection is handed to the replica's own sender
+     * thread instead of being written here. A master applying or propagating a write must
+     * never block on a replica that has stopped reading, and a thread that writes under the
+     * backlog's lock must never touch the socket at all: queueing is what lets both hold.</p>
+     */
+    private volatile Slave replica;
+
 
     public boolean getTransactionalContext(){return transactionalContext;}
 
@@ -48,21 +60,67 @@ public class Client {
         this.id = id;
     }
 
+    /** Records the replica this connection registered as, so its writes go through it. */
+    public void attachReplica(Slave replica){
+        this.replica = replica;
+    }
+
+    /** The replica this connection registered as, or null when it never registered. */
+    public Slave replica(){
+        return replica;
+    }
+
     // A replica connection is written to by whichever client thread is propagating at that
     // moment, so the frames have to be serialized per connection: two threads sharing an
-    // output stream can otherwise interleave halves of a frame.
+    // output stream can otherwise interleave halves of a frame. Once the connection has
+    // registered as a replica there is only ever one writer - its own sender thread - so the
+    // frame is queued instead, and the text and the payload travel as one frame so a large
+    // snapshot is never split across two queue entries.
     public synchronized void send(String res, byte[] data) throws IOException {
-        if(res !=null && !res.equals(""))
-            outputStream.write(res.getBytes());
-        if(data!=null)
-            outputStream.write(data);
+        deliver(frame(res, data));
     }
 
     public synchronized void send(ResponseDto res) throws IOException {
-        if(res.response !=null && !res.response.isEmpty())
-            outputStream.write(res.response.getBytes());
-        if(res.data!=null)
-            outputStream.write(res.data);
+        deliver(frame(res.response, res.data));
+    }
+
+    public synchronized void send(byte[] data) throws IOException {
+        deliver(frame(null, data));
+    }
+
+    public synchronized void send(String data) throws IOException {
+        deliver(frame(data, null));
+    }
+
+    /**
+     * Writes one whole frame, either onto the connection's output stream or - once the
+     * connection is a replica - into its bounded outbound buffer for its sender thread.
+     *
+     * <p>Queueing throws when the replica has fallen further behind than its buffer allows,
+     * which is the same I/O failure every caller already treats as a dropped replica.</p>
+     */
+    private void deliver(byte[] frame) throws IOException {
+        if(frame == null || frame.length == 0)
+            return;
+        Slave replica = this.replica;
+        if(replica != null){
+            replica.send(frame);
+            return;
+        }
+        outputStream.write(frame);
+    }
+
+    /** Joins the text of a reply and its payload into the one frame that travels it. */
+    private static byte[] frame(String res, byte[] data){
+        byte[] head = (res == null || res.isEmpty()) ? null : res.getBytes();
+        if(head == null)
+            return data;
+        if(data == null || data.length == 0)
+            return head;
+        byte[] frame = new byte[head.length + data.length];
+        System.arraycopy(head, 0, frame, 0, head.length);
+        System.arraycopy(data, 0, frame, head.length, data.length);
+        return frame;
     }
 
     public void close() {
@@ -80,15 +138,5 @@ public class Client {
         } catch (Exception e) {
             // the connection is being torn down, there is nothing left to recover
         }
-    }
-
-    public synchronized void send(byte[] data) throws IOException {
-        if(data!=null)
-            outputStream.write(data);
-    }
-
-    public synchronized void send(String data) throws IOException {
-        if(data!=null && !data.isEmpty())
-            outputStream.write(data.getBytes());
     }
 }

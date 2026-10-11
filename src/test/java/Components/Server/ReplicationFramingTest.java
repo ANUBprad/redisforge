@@ -2,6 +2,7 @@ package Components.Server;
 
 import Components.Infra.Client;
 import Components.Infra.RespStream;
+import Components.Infra.StoreSnapshot;
 import Components.Repository.Store;
 import Components.Service.RespSerializer;
 import Config.AppConfig;
@@ -34,13 +35,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * A replica reads the RDB and then a stream of RESP arrays from its master, and TCP is
- * free to end a read anywhere inside either one. These tests hand that upstream a
- * scripted byte stream so the split point is exact: every position inside a command,
+ * A replica reads the dataset snapshot and then a stream of RESP arrays from its master,
+ * and TCP is free to end a read anywhere inside either one. These tests hand that upstream
+ * a scripted byte stream so the split point is exact: every position inside a command,
  * one byte at a time, several commands in one read, a payload larger than the read
  * buffer, a master that hangs up mid command, and bytes that are not RESP at all. The
  * last two tests run a whole replica against a master that behaves the way this project
- * does, RDB payload and all.
+ * does, snapshot payload and all.
  */
 @SpringBootTest(classes = AppConfig.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -49,7 +50,8 @@ class ReplicationFramingTest {
 
     private static final long AWAIT_TIMEOUT_MS = 10_000;
     private static final String REPLICATION_ID = "0123456789abcdef0123456789abcdef01234567";
-    private static final String RDB_PAYLOAD = "REDIS0009pretend this is a serialized RDB payload";
+    /** a valid, empty dataset, encoded the way the project's own master hands one over */
+    private static final byte[] SNAPSHOT = StoreSnapshot.serialize(List.of());
 
     @Autowired
     private SlaveTcpServer slaveTcpServer;
@@ -183,7 +185,7 @@ class ReplicationFramingTest {
     }
 
     @Test
-    void replicaAppliesWhatTheMasterStreamsAfterTheRdb() throws Exception {
+    void replicaAppliesWhatTheMasterStreamsAfterTheSnapshot() throws Exception {
         byte[] first = frame("SET", "repl:one", "one");
         byte[] second = frame("SET", "repl:two", "two");
         byte[] third = frame("SET", "repl:three", "three");
@@ -206,7 +208,7 @@ class ReplicationFramingTest {
 
         // the first command is delivered a byte at a time, the rest in one write
         await(() -> "three".equals(value("repl:three")),
-                "the replica never applied the commands that followed the RDB payload");
+                "the replica never applied the commands that followed the snapshot payload");
 
         assertEquals("one", value("repl:one"), "the byte at a time command was applied in part");
         assertEquals("two", value("repl:two"));
@@ -230,10 +232,10 @@ class ReplicationFramingTest {
     }
 
     @Test
-    void replicaStaysUsableWhenTheRdbEndsEarly() throws Exception {
+    void replicaStaysUsableWhenTheSnapshotEndsEarly() throws Exception {
         replicaPort = freePort();
         int masterPort = freePort();
-        CompletableFuture<Void> master = CompletableFuture.runAsync(() -> runMasterWithShortRdb(masterPort));
+        CompletableFuture<Void> master = CompletableFuture.runAsync(() -> runMasterWithShortSnapshot(masterPort));
 
         redisConfig.setRole("slave");
         redisConfig.setPort(replicaPort);
@@ -252,7 +254,7 @@ class ReplicationFramingTest {
         }
     }
 
-    /** A master that hands over the RDB and then streams commands in awkward chunks. */
+    /** A master that hands over the snapshot and then streams commands in awkward chunks. */
     private void runMaster(int port) {
         try (ServerSocket serverSocket = new ServerSocket(port); Socket replica = serverSocket.accept()) {
             replica.setTcpNoDelay(true);
@@ -279,9 +281,8 @@ class ReplicationFramingTest {
             assertEquals("?", psync[1]);
             assertEquals("-1", psync[2]);
 
-            byte[] rdb = RDB_PAYLOAD.getBytes(StandardCharsets.UTF_8);
-            write(out, "+FULLRESYNC " + REPLICATION_ID + " 0\r\n$" + rdb.length + "\r\n");
-            out.write(rdb);
+            write(out, "+FULLRESYNC " + REPLICATION_ID + " 0\r\n$" + SNAPSHOT.length + "\r\n");
+            out.write(SNAPSHOT);
             out.flush();
 
             for (byte b : frame("SET", "repl:one", "one")) {
@@ -311,8 +312,8 @@ class ReplicationFramingTest {
         }
     }
 
-    /** A master that dies in the middle of the RDB payload it promised. */
-    private void runMasterWithShortRdb(int port) {
+    /** A master that dies in the middle of the snapshot payload it promised. */
+    private void runMasterWithShortSnapshot(int port) {
         try (ServerSocket serverSocket = new ServerSocket(port); Socket replica = serverSocket.accept()) {
             replica.setTcpNoDelay(true);
             InputStream in = replica.getInputStream();
@@ -327,9 +328,8 @@ class ReplicationFramingTest {
             write(out, "+OK\r\n");
             assertEquals("PSYNC", readRequest(requests, in)[0]);
 
-            byte[] rdb = RDB_PAYLOAD.getBytes(StandardCharsets.UTF_8);
-            write(out, "+FULLRESYNC " + REPLICATION_ID + " 0\r\n$" + rdb.length + "\r\n");
-            out.write(rdb, 0, rdb.length / 2);
+            write(out, "+FULLRESYNC " + REPLICATION_ID + " 0\r\n$" + SNAPSHOT.length + "\r\n");
+            out.write(SNAPSHOT, 0, SNAPSHOT.length / 2);
             out.flush();
         } catch (Exception e) {
             throw new IllegalStateException("the fake master failed: " + e, e);

@@ -41,8 +41,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>These tests drive the handler directly, with the bytes it writes captured, so the
  * decision is watched rather than inferred: both answers have to appear on the socket
  * itself - a resume with the bytes it missed behind it, a full resync with the dataset
- * behind it - and neither may be handed back to the caller, because a write made in the
- * gap between an answer and its bytes would take the stream apart.</p>
+ * and then the catch-up behind it - and neither may be handed back to the caller, because
+ * a write made between an answer and the bytes it stands on would take the stream apart.</p>
  */
 @SpringBootTest(classes = AppConfig.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)

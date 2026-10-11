@@ -4,6 +4,7 @@ import Components.Infra.Client;
 import Components.Infra.ConnectionPool;
 import Components.Infra.ReplicationBacklog;
 import Components.Infra.Slave;
+import Components.Infra.StoreSnapshot;
 import Components.Repository.Store;
 import Components.Repository.Value;
 import Components.Server.RedisConfig;
@@ -17,7 +18,6 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.BiFunction;
@@ -26,7 +26,6 @@ import java.util.logging.Logger;
 
 @Component
 public class CommandHandler {
-    private static final String emptyRdbFile = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==";
     private static final Logger logger = Logger.getLogger(CommandHandler.class.getName());
     @Autowired
     public RespSerializer respSerializer;
@@ -257,11 +256,14 @@ public class CommandHandler {
                 Slave previous = connectionPool.slaveAtPort(listeningPort, client);
                 connectionPool.removeClient(client);
                 Slave s = new Slave(client, listeningPort);
+                // the connection is now written to only through this replica's own sender
+                // thread, so no write a master applies can block on it
+                client.attachReplica(s);
                 connectionPool.addSlave(s);
                 if(previous != null){
+                    // removing the replica that this one replaces closes its socket, which
+                    // ends its read and unwinds its own handler
                     connectionPool.removeSlave(previous);
-                    // the stale connection's read ends here, which unwinds its own handler
-                    previous.connection.close();
                 }
                 return "+OK\r\n";
             }
@@ -303,15 +305,24 @@ public class CommandHandler {
      * is answered with a full resync, which is always safe because the replica adopts
      * whatever position this master's stream has reached.</p>
      *
-     * <p>Both answers are written from inside this method, with the backlog's lock held, and
-     * the whole answer - the position it names, the bytes behind it and the moment the
-     * replica becomes eligible for writes - is one step. Handing the reply back to the
-     * caller would open a gap between them: a write made in that gap would be counted after
-     * a position that does not include it, or reach a replica before the answer that tells
-     * it where it stands. Holding the lock across the whole thing is also what makes the
-     * answer indivisible against propagation, which counts and sends under the same lock.</p>
+     * <p>The resume is queued from inside this method, with the backlog's lock held, so its
+     * three parts - the position it names, the bytes behind it and the moment the replica
+     * becomes eligible for writes - are one step. Handing the reply back to the caller would
+     * open a gap between them: a write made in that gap would be counted after a position
+     * that does not include it, or reach a replica before the answer that tells it where it
+     * stands. Holding the lock across the whole thing is also what makes the answer
+     * indivisible against propagation, which counts and queues under the same lock. The
+     * frame is only queued here, never written to the socket: sending it is left to the
+     * replica's own sender thread, so no socket write ever happens under this lock.</p>
      *
-     * @return the reply to write, or null when this method has already written it
+     * <p>The refusal is decided on facts checked under the same hold of the lock. A full
+     * resync cuts its snapshot and the position it names under one hold of the lock, so the
+     * catch-up bytes replayed after it never include a command the snapshot already carries
+     * and never miss one that landed while it was being cut. Cutting the snapshot is work,
+     * not a socket write, so it holds the stream up the way an AOF write does - never by
+     * blocking on a peer.</p>
+     *
+     * @return the reply to write, or null when this method has already queued it
      */
     public ResponseDto psync(String[] command, Client client) throws IOException {
         if (command.length < 3) {
@@ -347,39 +358,68 @@ public class CommandHandler {
                 client.send("+CONTINUE " + replicationIdMaster + "\r\n", missed);
                 return null;
             }
-            // the position was refused on facts checked under this same hold of the lock, so
-            // the whole stream is handed over without a write getting between the decision
-            // and the answer to it
-            fullResync(client);
-            return null;
+            // the position was refused on facts checked under this same hold of the lock
         }
+        // the snapshot is made outside the lock so a large dataset does not stall the
+        // stream; its catch-up is queued under the lock to keep the handover atomic
+        fullResync(client);
+        return null;
     }
 
     /**
      * Hands over the whole stream from this position: a full resync line carrying the
-     * replication id and offset this replica should take on, and the dataset behind it.
+     * replication id and offset the replica should take on, and a snapshot of the dataset
+     * behind it.
      *
-     * <p>Written to the socket before this returns, under the backlog's lock, for the same
-     * reason a resume is: the position, the dataset and the moment the replica becomes
-     * eligible for the writes that follow cannot be taken apart.</p>
+     * <p>Queued, never written to the socket: the replica's own sender thread writes it.
+     * The snapshot is cut under the backlog's lock, same as an AOF write - it is work, not a
+     * socket write, so nothing ever blocks on a peer. Cutting it under the same hold as the
+     * position it is handed over with is what keeps the handover whole: a command that
+     * landed before the cut is already counted and caught by the read at the end, and one
+     * that lands while the answer is being queued has to wait for the hold, and reaches this
+     * replica after the step that tells it where it stands. Only the expensive serialization
+     * of a live copy could be spared the lock, and reading the offset apart from it would
+     * leave a window in which a command is either carried twice or lost.</p>
+     *
+     * <p>A backlog so small that the position fell out of its window while the snapshot was
+     * being made means this master can no longer bridge the gap alone, and nothing has been
+     * written yet, so the connection is closed without a byte going out: the replica's
+     * connect-and-read loop fails the attempt and comes back to ask again, landing on a
+     * resume if the position is still covered or on another full resync if not, never on a
+     * gap this master cannot fill.</p>
      */
     private void fullResync(Client client) throws IOException {
         ReplicationBacklog backlog = redisConfig.getReplicationBacklog();
+        byte[] snapshot;
+        String replicationId;
+        long replicationOffset;
         synchronized (backlog) {
-            String replicationId = redisConfig.getMasterReplId();
-            long replicationOffset = redisConfig.getMasterReplOffset();
-            String res = "+FULLRESYNC "+ replicationId +" "+replicationOffset+"\r\n";
+            replicationId = redisConfig.getMasterReplId();
+            replicationOffset = redisConfig.getMasterReplOffset();
+            snapshot = StoreSnapshot.serialize(store.liveSnapshot());
+        }
 
-            byte[] rdbFileData = Base64.getDecoder().decode(emptyRdbFile);
+        String res = "+FULLRESYNC " + replicationId + " " + replicationOffset + "\r\n";
+        byte[] header = ("$" + snapshot.length + "\r\n").getBytes();
 
-            String length = rdbFileData.length+"";
-
-            String fullResyncHeader = "$"+ length +"\r\n";
-            byte[] header = fullResyncHeader.getBytes();
-
+        synchronized (backlog) {
+            byte[] catchUp = backlog.read(replicationOffset);
+            if (catchUp == null) {
+                // the position was evicted while the snapshot was being made: closing the
+                // socket aborts the attempt before any of it goes out, so the replica asks
+                // again from a position that is either covered or one full resync away
+                client.close();
+                return;
+            }
+            // the stream opens and the answer is queued as one step under the lock - never
+            // written to the socket, which the replica's sender thread does outside it - so a
+            // write can neither reach this replica ahead of the snapshot that tells it where
+            // it stands nor disappear into a replica that was never told it was eligible
             startStream(client);
-
-            client.send(res, concatenate(header, rdbFileData));
+            client.send(res, concatenate(header, snapshot));
+            if (catchUp.length > 0) {
+                client.send(catchUp);
+            }
         }
     }
 
@@ -430,7 +470,7 @@ public class CommandHandler {
         String[] getackarr = new String[] { "REPLCONF", "GETACK", "*" };
         byte[] bytearr = respSerializer.respArray(getackarr).getBytes();
 
-        // straight down the thread that is waiting, so a replica cannot answer this
+        // queued behind whatever that replica has not read yet, so it cannot answer this
         // GETACK before the writes that were propagated ahead of it
         for(Slave slave: new ArrayList<>(connectionPool.getSlaves())){
             if(!slave.isReady()){
@@ -439,7 +479,7 @@ public class CommandHandler {
                 continue;
             }
             try {
-                slave.connection.send(bytearr);
+                slave.send(bytearr);
             } catch (IOException e) {
                 logger.log(Level.WARNING, "dropping a replica that could not be written to: " + e.getMessage());
                 connectionPool.removeSlave(slave);

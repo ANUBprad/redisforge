@@ -1,6 +1,7 @@
 package Components.Repository;
 
 import Components.Infra.Client;
+import Components.Infra.StoreSnapshot;
 import Components.Service.RespSerializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -34,7 +35,9 @@ public class Store {
     // ReentrantLock rather than a monitor, because a transaction has to hold the locks
     // of several stripes at once and release them one by one at the end.
     private final ReentrantLock[] keyLocks = createKeyLocks();
-    public ConcurrentHashMap<String, Value> map;
+    // volatile so that a snapshot install, which swaps in a fresh map, is seen whole by
+    // a reader that never took a lock of this store, and so a reference is never torn
+    public volatile ConcurrentHashMap<String, Value> map;
     @Autowired
     public RespSerializer respSerializer;
     public Store(){
@@ -365,6 +368,83 @@ public class Store {
             }
         } finally {
             keyLock.unlock();
+        }
+    }
+
+    /**
+     * The epoch millis of a value's deadline, or {@code null} for one that has none.
+     * A deadline so far out it stopped meaning "sometime" is treated as none, the same
+     * way {@link #persist} and the AOF treat it.
+     */
+    public Long absoluteExpiryMillis(Value value) {
+        if (value == null || value.expiry == null || value.expiry.equals(LocalDateTime.MAX)) return null;
+        return value.expiry.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+    }
+
+    /**
+     * The live keys as snapshot entries, captured under the read lock at one instant so
+     * every deadline is the one it carried then. Keys whose deadline had already passed
+     * are left out: a full resync hands over what a fresh connection would read, not
+     * what the collection still happens to hold, and the entries carry absolute
+     * deadlines so the replica's clock replaces the master's once they are installed.
+     *
+     * <p>Concurrent reads can still clean an expired key out from under this, but never a
+     * live one: a key that is not in the snapshot was already gone, and a key whose
+     * deadline this passes over has no business in it. The caller is expected to hold
+     * the replication backlog while it runs, which excludes every other data write, so
+     * the map reference cannot be swapped out from under the iteration.</p>
+     */
+    public List<StoreSnapshot.Entry> liveSnapshot() {
+        LocalDateTime now = LocalDateTime.now();
+        List<StoreSnapshot.Entry> entries = new ArrayList<>();
+        rwLock.readLock().lock();
+        try {
+            for (Map.Entry<String, Value> entry : map.entrySet()) {
+                Value value = entry.getValue();
+                if (value == null || value.expiry.isBefore(now)) continue;
+                entries.add(new StoreSnapshot.Entry(
+                        entry.getKey(), value.val, absoluteExpiryMillis(value)));
+            }
+        } finally {
+            rwLock.readLock().unlock();
+        }
+        entries.sort(Comparator.comparing(StoreSnapshot.Entry::key));
+        return entries;
+    }
+
+    /**
+     * Replaces the whole contents of the store with the keys a full resync carried. The
+     * fresh map is built outside the write lock and swapped in under it, so readers see
+     * either the old keys or the new ones, never a mixture, while a long installation
+     * does not stall reads of the keys that are still in place.
+     *
+     * <p>Only the entries the install arrives with survive: keys the master did not hand
+     * over are gone, which is what a full resync means. A deadline that has already
+     * passed by the time the snapshot lands is not resurrected - the master would
+     * consider it expired too by then. The caller is expected to hold the replication
+     * backlog while it runs, so a downstream resync that serializes this store and an
+     * install can never interleave.</p>
+     */
+    public void installSnapshot(List<StoreSnapshot.Entry> entries) {
+        LocalDateTime now = LocalDateTime.now();
+        ConcurrentHashMap<String, Value> fresh = new ConcurrentHashMap<>(
+                Math.max(16, entries.size() * 2));
+        for (StoreSnapshot.Entry entry : entries) {
+            if (entry.deadlineEpochMillis() == null) {
+                fresh.put(entry.key(), new Value(entry.value(), now, LocalDateTime.MAX));
+            } else {
+                LocalDateTime expiry = LocalDateTime.ofInstant(
+                        Instant.ofEpochMilli(entry.deadlineEpochMillis()), ZoneId.systemDefault());
+                if (!expiry.isBefore(now)) {
+                    fresh.put(entry.key(), new Value(entry.value(), now, expiry));
+                }
+            }
+        }
+        rwLock.writeLock().lock();
+        try {
+            this.map = fresh;
+        } finally {
+            rwLock.writeLock().unlock();
         }
     }
 

@@ -3,6 +3,7 @@ package Components.Server;
 import Components.Infra.ConnectionPool;
 import Components.Infra.RespStream;
 import Components.Infra.Slave;
+import Components.Infra.StoreSnapshot;
 import Components.Service.RespSerializer;
 import Config.AppConfig;
 import org.junit.jupiter.api.AfterEach;
@@ -41,9 +42,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>A reconnect here is a fresh handshake, and then one of two things: a master that still
  * holds the bytes the replica missed answers with a resume, and the replica carries on from
  * where it stopped with those bytes written ahead of it; a master that cannot - because it
- * restarted, or the position fell out of what it keeps - hands over a full resync and an
- * empty RDB, which backfills nothing. The tests below cover both halves: the writes a
- * resumed link backfills, and the writes a replaced stream leaves alone.</p>
+ * restarted, or the position fell out of what it keeps - hands over a full resync and a
+ * snapshot of the dataset behind the position the stream has reached. The tests below cover
+ * both halves: the writes a resumed link backfills, and the dataset a replaced stream
+ * hands over.</p>
  */
 class ReplicaRecoveryTest {
 
@@ -193,6 +195,81 @@ class ReplicaRecoveryTest {
         awaitValue(last, "chain:still", "and still going");
         assertEquals(1, middle.slaveCount(),
                 "the last hop attached to the middle hop more than once");
+    }
+
+    /**
+     * The reason a full resync is the whole dataset rather than an empty stand-in: a replica
+     * that attaches to a master which already holds keys is handed those keys by the
+     * snapshot, and the writes that follow land on top of the dataset instead of on an
+     * empty store.
+     */
+    @Test
+    void aReplicaThatAttachesToAMasterThatAlreadyHoldsDataIsHandedThatData() throws Exception {
+        int masterPort = freePort();
+        Node master = startMaster(masterPort);
+        master.awaitPortOpen();
+
+        set(master.port, "snapshot:before", "already there");
+
+        Node replica = startReplica(freePort(), masterPort);
+        replica.awaitPortOpen();
+        awaitRegisteredAndReady(master, 1);
+
+        awaitValue(replica, "snapshot:before", "already there");
+
+        set(master.port, "snapshot:after", "written after the attach");
+        awaitValue(replica, "snapshot:after", "written after the attach");
+    }
+
+    /**
+     * A full resync trades the whole dataset, not just the missing writes: the stream that
+     * comes after the handshake is applied on top of the snapshot, and a key this hop held
+     * that its master no longer has goes away when the snapshot replaces the store. The
+     * deadline a handed-over entry carries is its master's own, so the key expires at that
+     * same wall-clock instant here rather than the delay being counted again.
+     */
+    @Test
+    void aFullResyncTradesTheDatasetThisHopHeldForTheOneItsMasterCarries() throws Exception {
+        int masterPort = freePort();
+        Node replica = startReplica(freePort(), masterPort);
+        replica.awaitPortOpen();
+
+        try (ScriptedMaster scripted = new ScriptedMaster(masterPort, replica.port)) {
+            // the first stream starts from the dataset it handed over, and writes one key
+            scripted.attach();
+            scripted.handshake();
+            scripted.stream(frame("SET", "snapshot:stale", "stale"));
+            awaitValue(replica, "snapshot:stale", "stale");
+            scripted.hangUp();
+
+            // the new stream carries a dataset that keeps one entry and brings a deadline,
+            // so the stale key has to go away with the dataset it was part of
+            long deadline = System.currentTimeMillis() + 5_000;
+            scripted.attach();
+            scripted.handshakeWith(StoreSnapshot.serialize(List.of(
+                    new StoreSnapshot.Entry("snapshot:kept", "kept", null),
+                    new StoreSnapshot.Entry("snapshot:expiring", "soon", deadline))));
+            await(() -> {
+                try {
+                    return "kept".equals(get(replica.port, "snapshot:kept"))
+                            && get(replica.port, "snapshot:stale") == null;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, "the dataset the new stream handed over did not replace the old one");
+
+            // the deadline travelled with the entry, so the key expires on the master's clock
+            try (RespSocket client = new RespSocket(replica.port)) {
+                client.send(frame("PTTL", "snapshot:expiring"));
+                int remaining = Integer.parseInt(client.readLine().substring(1));
+                assertTrue(remaining > 1_000 && remaining <= 5_000,
+                        "the deadline did not ride along as an absolute one: " + remaining + "ms");
+            }
+
+            // and the stream continues on top of the handed-over dataset
+            scripted.stream(frame("SET", "snapshot:after", "after the swap"));
+            awaitValue(replica, "snapshot:after", "after the swap");
+        }
     }
 
     @Test
@@ -513,11 +590,20 @@ class ReplicaRecoveryTest {
             awaitValue(replica, "scripted:counter", "1");
             scripted.hangUp();
 
-            // the second attachment, made by the replica on its own
+            // the second attachment, made by the replica on its own. It is a full resync
+            // again, and the dataset it hands over replaces the store, so the counter the
+            // first stream wrote is gone before the new stream is applied to a fresh one
             scripted.attach();
             scripted.handshake();
+            await(() -> {
+                try {
+                    return get(replica.port, "scripted:counter") == null;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, "the dataset handed over by the second full resync did not replace the store");
             scripted.stream(frame("INCR", "scripted:counter"));
-            awaitValue(replica, "scripted:counter", "2");
+            awaitValue(replica, "scripted:counter", "1");
 
             // nothing is listening any more, so no further attempt can be counted as a
             // connection: two is one per stream, which is what a single follower does
@@ -525,8 +611,8 @@ class ReplicaRecoveryTest {
             Thread.sleep(500);
             assertEquals(2, scripted.connections(),
                     "the replica opened a connection that no stream used, so it has more than one follower");
-            // a stream applied twice would have left the counter at four
-            assertEquals("2", get(replica.port, "scripted:counter"),
+            // a stream applied twice would have left the counter at two
+            assertEquals("1", get(replica.port, "scripted:counter"),
                     "a replicated command was applied more than once");
         }
     }
@@ -690,13 +776,12 @@ class ReplicaRecoveryTest {
     }
 
     /**
-     * A master that hands over the RDB and streams whatever a test tells it to, one
+     * A master that hands over the snapshot and streams whatever a test tells it to, one
      * attachment at a time, so a reconnect can be watched request by request.
      */
     private static final class ScriptedMaster implements AutoCloseable {
-        /** the same empty RDB the project's own master sends behind the FULLRESYNC line */
-        private static final String EMPTY_RDB_BASE64 =
-                "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW1CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==";
+        /** a valid, empty dataset, encoded the way the project's own master hands one over */
+        private static final byte[] EMPTY_SNAPSHOT = StoreSnapshot.serialize(List.of());
         private final ServerSocket serverSocket;
         private final RespSerializer respSerializer = new RespSerializer();
         private final AtomicInteger connections = new AtomicInteger();
@@ -729,6 +814,11 @@ class ReplicaRecoveryTest {
         }
 
         private void handshake() throws IOException {
+            handshakeWith(EMPTY_SNAPSHOT);
+        }
+
+        /** Handles the handshake, answering full resync with a snapshot of the caller's choice. */
+        private void handshakeWith(byte[] snapshot) throws IOException {
             requestHandshake();
             String[] psync = request();
             assertEquals("PSYNC", psync[0], "the attachment did not ask for the command stream");
@@ -746,9 +836,8 @@ class ReplicaRecoveryTest {
             // the offset is the position in the write stream, as our own master and real Redis
             // both send it: a plain number the replica can pick its own stream up from
             write("+FULLRESYNC scriptedreplid 0");
-            byte[] rdb = java.util.Base64.getDecoder().decode(EMPTY_RDB_BASE64);
-            write("$" + rdb.length);
-            out.write(rdb);
+            write("$" + snapshot.length);
+            out.write(snapshot);
             out.flush();
         }
 

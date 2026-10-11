@@ -99,10 +99,16 @@ class StoreConcurrencyTest {
                 awaitQuietly(start);
                 try {
                     for (int n = 0; n < perThread; n++) {
-                        String reply = store.get("counter");
-                        if (reply.equals("$-1\r\n")) {
-                            continue;
-                        }
+                        // wait for the incrementers to create the key: a read that saw
+                        // nothing proves nothing, and letting the loop skip it would make
+                        // the assertion below about scheduling rather than the counter
+                        String reply;
+                        do {
+                            reply = store.get("counter");
+                            if (reply.equals("$-1\r\n")) {
+                                Thread.onSpinWait();
+                            }
+                        } while (reply.equals("$-1\r\n"));
                         int value = parseBulkString(reply);
                         assertTrue(value >= 0, "read a counter that cannot exist: " + reply);
                         seen.incrementAndGet();

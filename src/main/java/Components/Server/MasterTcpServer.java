@@ -3,6 +3,8 @@ package Components.Server;
 import Components.Infra.ConnectionPool;
 import Components.Infra.Slave;
 import Components.Persistence.AppendOnlyPersistence;
+import Components.Repository.MemoryEstimator;
+import Components.Repository.MemoryManager;
 import Components.Repository.Store;
 import Components.Repository.Value;
 import Components.Service.CommandHandler;
@@ -16,6 +18,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
@@ -47,6 +50,8 @@ public class MasterTcpServer {
     private Store store;
     @Autowired
     private AppendOnlyPersistence appendOnlyPersistence;
+    @Autowired
+    private MemoryManager memoryManager;
     /** the listener, gate and handler pool this server runs its clients on */
     private final ClientListener listener = new ClientListener("master", this::handleClient);
 
@@ -181,29 +186,44 @@ public class MasterTcpServer {
                 // a transaction can never serialize a store whose writes are only half
                 // counted into the stream, and the file lock is taken inside it, in the
                 // order a single command takes them
+                String transactionError;
                 synchronized (redisConfig.getReplicationBacklog()) {
+                    String[] errorHolder = new String[1];
                     // the whole transaction is recorded under one hold of the file lock, right
                     // after the store applied it, so it lands in the file as one block and in
-                    // the same order the store was changed in
+                    // the same order the store was changed in. The memory admission runs
+                    // inside the store apply, so a transaction that would not fit is refused
+                    // whole and leaves neither a partial commit nor a file entry
                     appendOnlyPersistence.locked(() -> {
-                        store.executeTransaction(client, transactionCacheApplier);
-                        appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
+                        errorHolder[0] = store.executeTransaction(
+                                client, transactionCacheApplier, memoryManager::admitTransaction);
+                        if (errorHolder[0] == null) {
+                            appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
+                        }
                         return null;
                     });
+                    transactionError = errorHolder[0];
 
                     client.endTransaction();
-                    while(!commands.isEmpty()){
-                        // each command is counted and sent as one step, so a replica that asks
-                        // to carry on between two of them is resumed at a whole frame. An
-                        // expiration is sent in its absolute form, so a replica expiring the
-                        // key does not start the clock over on its own.
-                        propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
+                    if (transactionError == null) {
+                        while(!commands.isEmpty()){
+                            // each command is counted and sent as one step, so a replica that asks
+                            // to carry on between two of them is resumed at a whole frame. An
+                            // expiration is sent in its absolute form, so a replica expiring the
+                            // key does not start the clock over on its own.
+                            propagate(appendOnlyPersistence.replicationFrame(commands.poll()));
+                        }
                     }
                 }
 
-                String response = respSerializer.respArray(client.transactionResponse);
-
-                client.send(response);
+                if (transactionError != null) {
+                    // a refused transaction is answered with the refusal itself, not with a
+                    // per-command array, because none of its commands were applied
+                    client.send(transactionError);
+                } else {
+                    String response = respSerializer.respArray(client.transactionResponse);
+                    client.send(response);
+                }
 
                 break;
             case "DISCARD":
@@ -291,9 +311,25 @@ public class MasterTcpServer {
                 // never counts an increment that is not visible yet or the other way round
                 synchronized (redisConfig.getReplicationBacklog()) {
                     res = appendOnlyPersistence.locked(() -> {
-                        ReentrantLock keyLock = store.lockFor(command[1]);
+                        String key = command[1];
+                        ReentrantLock keyLock = store.lockFor(key);
                         keyLock.lock();
                         try {
+                            // the size the increment would leave behind, judged before the
+                            // store is touched: a refused increment must not evict anything
+                            long newEntryBytes = incrementResultBytes(key);
+                            if (newEntryBytes < 0) {
+                                // the value is not an integer, so the increment will be
+                                // refused: nothing to admit and nothing to write down
+                                return commandHandler.incr(command);
+                            }
+                            MemoryManager.Admission admission = memoryManager.admit(key, newEntryBytes);
+                            if (admission.rejected()) {
+                                return admission.error();
+                            }
+                            for (String evicted : admission.evictedKeys()) {
+                                evict(evicted);
+                            }
                             String increment = commandHandler.incr(command);
                             // an increment that was refused is not a mutation, so it is neither
                             // written to the file nor replicated
@@ -318,6 +354,25 @@ public class MasterTcpServer {
                 // apart in the middle of a full resync. The file lock is taken inside it.
                 synchronized (redisConfig.getReplicationBacklog()) {
                     res = appendOnlyPersistence.locked(() -> {
+                        // the form is parsed first so the size of the write can be judged
+                        // before the store is touched, and a malformed SET is refused without
+                        // evicting anything or reaching the file or the replicas
+                        CommandHandler.SetForm form = commandHandler.parseSetForm(command);
+                        if (form.error() != null) {
+                            return form.error();
+                        }
+                        LocalDateTime expiry = form.expiryMillis() == null
+                                ? LocalDateTime.MAX
+                                : LocalDateTime.now().plusNanos(form.expiryMillis().longValue() * 1_000_000L);
+                        long newEntryBytes = MemoryEstimator.entryBytes(
+                                form.key(), form.value(), expiry);
+                        MemoryManager.Admission admission = memoryManager.admit(form.key(), newEntryBytes);
+                        if (admission.rejected()) {
+                            return admission.error();
+                        }
+                        for (String evicted : admission.evictedKeys()) {
+                            evict(evicted);
+                        }
                         String set = commandHandler.set(command);
                         if (set.startsWith("+")) {
                             // the store has the deadline the command asked for, so the entry
@@ -429,6 +484,39 @@ public class MasterTcpServer {
                 return applied;
             });
         }
+    }
+
+    /**
+     * Writes down and passes on one key the memory policy removed to make room for a
+     * write. An eviction is an ordinary {@code DEL} everywhere else: it reaches the file
+     * and every replica so a restarted master and its replicas drop the same key at the
+     * same point in the stream, rather than each deciding on its own.
+     */
+    private void evict(String key) {
+        String[] del = new String[]{"DEL", key};
+        appendOnlyPersistence.appendApplied(del);
+        propagate(del);
+    }
+
+    /**
+     * The bytes an increment of {@code key} would leave behind, or {@code -1} when the
+     * current value is not an integer and the increment would be refused. Read before the
+     * increment applies, so a write can be judged and room made for it without first
+     * changing the keyspace.
+     */
+    private long incrementResultBytes(String key) {
+        LocalDateTime now = LocalDateTime.now();
+        Value current = store.peekValue(key);
+        if (current == null || current.expiry.isBefore(now)) {
+            return MemoryEstimator.entryBytes(key, "1", LocalDateTime.MAX);
+        }
+        int next;
+        try {
+            next = Integer.parseInt(current.val) + 1;
+        } catch (NumberFormatException notAnInteger) {
+            return -1L;
+        }
+        return MemoryEstimator.entryBytes(key, String.valueOf(next), current.expiry);
     }
 
     private void propagate(String[] command) {

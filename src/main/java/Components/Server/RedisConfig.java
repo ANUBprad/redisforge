@@ -2,6 +2,7 @@ package Components.Server;
 
 
 import Components.Infra.ReplicationBacklog;
+import Components.Repository.EvictionPolicy;
 import org.springframework.stereotype.Component;
 
 import java.util.UUID;
@@ -25,6 +26,10 @@ public class RedisConfig {
     private String appendfsync = "everysec";
     private int maxClients = DEFAULT_MAX_CLIENTS;
     private int clientTimeoutMs = DEFAULT_CLIENT_TIMEOUT_MS;
+    /** the memory ceiling for the keyspace, in estimated bytes; 0 means no limit */
+    private long maxmemory = 0;
+    /** the policy a write past the ceiling is admitted by, or refused under */
+    private EvictionPolicy maxmemoryPolicy = EvictionPolicy.NOEVICTION;
     // named from the moment this config exists: reading it from two threads before it
     // was ever written would otherwise race the lazy initialization
     private volatile String masterReplId = newReplicationId();
@@ -227,6 +232,40 @@ public class RedisConfig {
             throw new IllegalArgumentException("client timeout must not be negative, got " + clientTimeoutMs);
         }
         this.clientTimeoutMs = clientTimeoutMs;
+    }
+
+    /** The memory ceiling for the keyspace, in estimated bytes; 0 means no limit. */
+    public long getMaxmemory() {
+        return maxmemory;
+    }
+
+    /**
+     * Sets the memory ceiling. A negative value is refused, and 0 means the server never
+     * evicts and never refuses a write for memory.
+     */
+    public void setMaxmemory(long maxmemory) {
+        if (maxmemory < 0) {
+            throw new IllegalArgumentException("maxmemory must not be negative, got " + maxmemory);
+        }
+        this.maxmemory = maxmemory;
+    }
+
+    /** The policy a write past {@link #getMaxmemory()} is admitted by. */
+    public EvictionPolicy getMaxmemoryPolicy() {
+        return maxmemoryPolicy;
+    }
+
+    /**
+     * Sets the eviction policy by its configuration name, in any letter case. A name the
+     * server does not know is refused rather than quietly treated as {@code noeviction},
+     * so a typo is never mistaken for the safe default.
+     */
+    public void setMaxmemoryPolicy(String name) {
+        EvictionPolicy policy = EvictionPolicy.parse(name);
+        if (policy == null) {
+            throw new IllegalArgumentException("unknown maxmemory policy '" + name + "'");
+        }
+        this.maxmemoryPolicy = policy;
     }
 
 }

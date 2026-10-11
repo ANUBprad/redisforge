@@ -15,6 +15,9 @@ and asynchronous master/replica replication.
   with `BGREWRITEAOF`
 - Replication: `REPLCONF`, `PSYNC` (partial and full resync) and `WAIT`
 - Master and replica modes, with support for chained replication
+- Memory accounting with an optional `--maxmemory` ceiling and Redis-style eviction
+  policies (`noeviction`, `allkeys-lru`, `allkeys-random`, `volatile-lru`,
+  `volatile-random`, `volatile-ttl`), reported through `INFO memory`
 
 ## Requirements
 
@@ -54,6 +57,8 @@ Options:
 | `--repl-backlog-size <bytes>` | How much of the replication stream a master keeps for partial resyncs | `1048576` |
 | `--max-clients <count>` | Connections accepted at once; one more is refused with an error | `256` |
 | `--timeout <seconds>` | Close a connection that stays silent this long; `0` disables | `300` |
+| `--maxmemory <bytes>` | Memory ceiling for the keyspace; `0` means no limit | `0` |
+| `--maxmemory-policy <policy>` | How a write past `--maxmemory` is admitted: `noeviction`, `allkeys-lru`, `allkeys-random`, `volatile-lru`, `volatile-random`, `volatile-ttl` | `noeviction` |
 
 Start a replica:
 
@@ -113,6 +118,40 @@ Restarting the server with the same `--appendfilename` recovers the data:
 java -jar target/redisforge.jar --appendonly yes --appendfilename data/appendonly.aof
 ```
 
+## Memory limits
+
+A master can be given a ceiling on how large its keyspace is allowed to grow, and a rule
+for what to do when a write would put it over:
+
+```sh
+java -jar target/redisforge.jar --maxmemory 268435456 --maxmemory-policy allkeys-lru
+```
+
+- The size of a key is a logical estimate, not the JVM's resident memory: a fixed
+  overhead per entry, the UTF-8 bytes of the key and the value, and a few bytes more for
+  a key that carries a deadline. It is stable across runs and platforms, which is what a
+  limit has to be to mean the same thing everywhere. `INFO memory` reports the same
+  number it compares against, so `used_memory` is the quantity `maxmemory` is judged
+  against, not the process's RSS.
+- A write is judged by the size the keyspace *would* have once it lands: the bytes the
+  target key already holds are given back before the new entry is charged. A write that
+  fits is admitted with nothing removed.
+- With `--maxmemory-policy noeviction` a write that would not fit is refused with
+  `-OOM command not allowed when used memory > 'maxmemory'.` and the keyspace is left
+  exactly as it was.
+- The other policies remove keys until the write fits. `allkeys-lru` and
+  `allkeys-random` may remove any key; `volatile-lru`, `volatile-random` and
+  `volatile-ttl` remove only keys that carry a deadline. When the policy has nothing it
+  may remove — the keyspace is empty, or a `volatile-` policy finds no key with a
+  deadline — the write is refused with the same `-OOM` error.
+- A key the policy removes is written to the append-only file and passed to replicas as
+  the `DEL` it is, so a replica ends up holding exactly what its master held. A replica
+  never evicts on its own account: it applies the writes its master sends, `DEL`s
+  included, even when a ceiling is configured on the replica too.
+- A transaction is admitted as a unit or refused as one. If the state it would commit
+  does not fit the ceiling, `EXEC` answers `-OOM` and commits nothing, rather than being
+  made to fit by removing keys the queued commands never mentioned.
+
 ## Docker
 
 ```sh
@@ -143,9 +182,9 @@ image you published.
 
 ### Master
 
-`PING`, `ECHO`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO replication`,
-`REPLCONF`, `PSYNC`, `WAIT`, `BGREWRITEAOF`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`,
-`PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
+`PING`, `ECHO`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO`
+(sections `server`, `replication`, `memory`, `all`), `REPLCONF`, `PSYNC`, `WAIT`,
+`BGREWRITEAOF`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
 `DEL` is only handled inside a transaction.
 
@@ -153,6 +192,10 @@ image you published.
 non-positive delay) and `:0` when the key does not exist. `TTL` / `PTTL` answer the
 remaining time, `:-1` for a key with no deadline, and `:-2` for a key that is not there.
 `PERSIST` answers `:1` when a deadline was removed and `:0` when there was none.
+
+With `--maxmemory` set, a write that would not fit the ceiling is either admitted after
+evicting keys by the configured policy or refused with `-OOM`. See
+[Memory limits](#memory-limits).
 
 ### Replica
 
@@ -173,9 +216,13 @@ since a replica keeps no file of its own.
   non-numeric expiry answers `-ERR value is not an integer or out of range`, and zero or
   a negative one answers `-ERR invalid expire time in 'set' command`. A refused `SET`
   stores nothing.
-- `INFO` answers `# Server` and `# Replication` for a bare `INFO` or `INFO all`, just
-  `# Replication` for `INFO replication`, just `# Server` for `INFO server`, and
-  `-ERR Invalid INFO section specified` for anything else.
+- `INFO` answers `# Server`, `# Replication` and `# Memory` for a bare `INFO` or
+  `INFO all`, a single section for `INFO server`, `INFO replication` or `INFO memory`,
+  and `-ERR Invalid INFO section specified` for anything else.
+- With a memory ceiling set, a write that cannot be admitted — the policy is
+  `noeviction`, or a `volatile-` policy has no key with a deadline to remove — is
+  answered with `-OOM command not allowed when used memory > 'maxmemory'.` and nothing
+  is stored or written down.
 - An empty multibulk request (`*0`) cannot be resynchronised from, so it is answered with
   `-ERR Protocol error: empty multibulk request` and the connection is closed.
 - Errors are replies, not disconnects: after any of the above (except the protocol
@@ -195,6 +242,10 @@ since a replica keeps no file of its own.
   keys in opposite orders cannot deadlock.
 - With `--timeout` set above 0, a connection that sends nothing for that long is
   reclaimed by the server; a registered replica is exempt while it follows its master.
+- A client write is judged against `--maxmemory` under the same hold of the replication
+  backlog that applies and records it, so the keys an eviction removed and the write they
+  made room for reach the append-only file and the replicas in the one order they
+  happened in. See [Memory limits](#memory-limits).
 - A replica write attempt, an unknown command and an arity mistake are answered with an
   error on the connection that sent them and affect nothing else.
 
@@ -210,9 +261,9 @@ since a replica keeps no file of its own.
 
 ## Limitations
 
-- With `--appendonly no`, and always for a replica, data is held in memory only.
-  The RDB shipped behind a full resync is empty, so a replica restored that way starts
-  empty until its master sends more.
+- With `--appendonly no`, and always for a replica, data is held in memory only. A
+  replica restored by a full resync is handed its master's current dataset, so it starts
+  from the keys its master holds rather than empty.
 - There is no RDB snapshot: recovery always replays the append-only file.
   `BGREWRITEAOF` compacts it on demand, but nothing rewrites it in the background, so
   between rewrites the file holds the full history of the writes it replays.
@@ -223,16 +274,19 @@ since a replica keeps no file of its own.
   Anything else: a replica that has never synced, a replication id this master does not
   have, a position ahead of the stream or one that has already fallen out of the backlog,
   or a position that does not parse, is answered with a full resync, which is always safe
-  because the replica takes on whatever position the master's stream has reached. Since
-  the shipped RDB is empty, a full resync necessarily starts the replica from an empty
-  keyspace, and the stream that follows rebuilds it from the writes that come after.
+  because the replica takes on whatever position the master's stream has reached. A full
+  resync ships the master's current dataset behind the `+FULLRESYNC` line, so the replica
+  replaces its keyspace with the master's live keys, keeping each key's remaining
+  deadline, and the stream that follows keeps it in step from there.
 - No failover: a master that goes away is not replaced, and there is no Sentinel or
   Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.
 - Keys expire lazily when they are read, and a bounded background sweep (100 keys per
-  tick) removes keys that are never read again. There is no eviction policy, and the
-  sweep's removals are not written to the append-only file or propagated: replicas drop
-  the same keys lazily or on the master's next deadline-carrying command.
+  tick) removes keys that are never read again. These expiration removals are not written
+  to the append-only file or propagated: replicas drop the same keys lazily or on the
+  master's next deadline-carrying command. Eviction under `--maxmemory` is different: a
+  key the policy removes is written down and propagated as a `DEL`, so a replica stays in
+  step with its master (see [Memory limits](#memory-limits)).
 - Only the commands listed under [Supported commands](#supported-commands) are
   implemented; RedisForge is not a drop-in replacement for Redis.
 

@@ -12,9 +12,11 @@ import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -38,6 +40,21 @@ public class Store {
     // volatile so that a snapshot install, which swaps in a fresh map, is seen whole by
     // a reader that never took a lock of this store, and so a reference is never torn
     public volatile ConcurrentHashMap<String, Value> map;
+    /**
+     * The bytes the keyspace is charged, by the same account {@link MemoryEstimator}
+     * keeps. Every write that puts, replaces or removes an entry moves it so it always
+     * describes what {@link #map} holds, even for keys whose deadline has passed but
+     * has not been cleaned up yet.
+     */
+    private final AtomicLong datasetBytes = new AtomicLong();
+    /**
+     * The last step of the access sequence that was handed out. Every touch of a key
+     * takes the next step, so the sequence never moves other than forwards and the
+     * least recently used key is the one with the smallest {@link Value#lastAccess}.
+     */
+    private final AtomicLong accessSequence = new AtomicLong();
+    /** How many keys the eviction policy has removed to admit a write. */
+    private final AtomicLong evictedKeys = new AtomicLong();
     @Autowired
     public RespSerializer respSerializer;
     public Store(){
@@ -82,6 +99,44 @@ public class Store {
         }
     }
 
+    /** The logical bytes the keyspace is currently charged, used to judge eviction. */
+    public long currentBytes() {
+        return datasetBytes.get();
+    }
+
+    /** How many keys the eviction policy has removed to make room since the store started. */
+    public long evictedKeys() {
+        return evictedKeys.get();
+    }
+
+    /** Counts one key removed by the eviction policy, for {@code INFO memory}. */
+    public void recordEviction() {
+        evictedKeys.incrementAndGet();
+    }
+
+    /**
+     * The logical bytes one key contributes right now: the size of its current entry, or
+     * zero when the key is not in the map. The expiry is deliberately ignored, because
+     * a key whose deadline has passed may still be in the map, and its bytes are still
+     * counted in {@link #currentBytes()} until the cleanup takes them out.
+     */
+    public long entryBytes(String key) {
+        Value value = map.get(key);
+        return value == null ? 0 : bytesOf(key, value);
+    }
+
+    /** The logical bytes of one concrete entry. */
+    private long bytesOf(String key, Value value) {
+        return MemoryEstimator.entryBytes(key, value.val, value.expiry);
+    }
+
+    /** Records that a key was used, at the next step of the access sequence. */
+    private void touch(Value value) {
+        if (value != null) {
+            value.lastAccess = accessSequence.incrementAndGet();
+        }
+    }
+
     public String set(String key, String val){
         ReentrantLock keyLock = lockFor(key);
         keyLock.lock();
@@ -89,7 +144,9 @@ public class Store {
             rwLock.writeLock().lock();
             try{
                 Value value = new Value(val, LocalDateTime.now(), LocalDateTime.MAX);
-                map.put(key, value);
+                Value previous = map.put(key, value);
+                datasetBytes.addAndGet(bytesOf(key, value) - (previous == null ? 0 : bytesOf(key, previous)));
+                touch(value);
                 return "+OK\r\n";
             } catch (Exception e) {
                 logger.log(Level.SEVERE, e.getMessage());
@@ -111,7 +168,9 @@ public class Store {
                 LocalDateTime now = LocalDateTime.now();
                 LocalDateTime exp = now.plus(expiryMilliseconds, ChronoUnit.MILLIS);
                 Value value = new Value(val, now, exp);
-                map.put(key, value);
+                Value previous = map.put(key, value);
+                datasetBytes.addAndGet(bytesOf(key, value) - (previous == null ? 0 : bytesOf(key, previous)));
+                touch(value);
                 return "+OK\r\n";
             } catch (Exception e) {
                 logger.log(Level.SEVERE, e.getMessage());
@@ -138,7 +197,9 @@ public class Store {
                 LocalDateTime expiry = LocalDateTime.ofInstant(
                         Instant.ofEpochMilli(expiryEpochMillis), ZoneId.systemDefault());
                 Value value = new Value(val, LocalDateTime.now(), expiry);
-                map.put(key, value);
+                Value previous = map.put(key, value);
+                datasetBytes.addAndGet(bytesOf(key, value) - (previous == null ? 0 : bytesOf(key, previous)));
+                touch(value);
             } finally{
                 rwLock.writeLock().unlock();
             }
@@ -147,14 +208,21 @@ public class Store {
         }
     }
 
-    /** Removes a key outright, the way a committed DEL inside a transaction does. */
-    public void delete(String key) {
+    /**
+     * Removes a key outright; {@code true} when the key was actually there. The eviction
+     * policy and a committed DEL inside a transaction are the two callers.
+     */
+    public boolean delete(String key) {
         ReentrantLock keyLock = lockFor(key);
         keyLock.lock();
         try {
             rwLock.writeLock().lock();
             try{
-                map.remove(key);
+                Value removed = map.remove(key);
+                if (removed != null) {
+                    datasetBytes.addAndGet(-bytesOf(key, removed));
+                }
+                return removed != null;
             } finally{
                 rwLock.writeLock().unlock();
             }
@@ -175,11 +243,16 @@ public class Store {
             LocalDateTime now = LocalDateTime.now();
             Value current = map.get(key);
             if (current != null && current.expiry.isBefore(now)) {
-                map.remove(key, current);
+                if (map.remove(key, current)) {
+                    datasetBytes.addAndGet(-bytesOf(key, current));
+                }
                 current = null;
             }
             if (current == null) {
-                map.put(key, new Value("1", now, LocalDateTime.MAX));
+                Value created = new Value("1", now, LocalDateTime.MAX);
+                map.put(key, created);
+                datasetBytes.addAndGet(bytesOf(key, created));
+                touch(created);
                 return respSerializer.respInteger(1);
             }
             int incremented;
@@ -189,7 +262,10 @@ public class Store {
                 return "-ERR value is not an integer or out of range\r\n";
             }
             // a counter keeps the expiry the key already carried
-            map.put(key, new Value(String.valueOf(incremented), current.created, current.expiry));
+            Value successor = new Value(String.valueOf(incremented), current.created, current.expiry);
+            map.put(key, successor);
+            datasetBytes.addAndGet(bytesOf(key, successor) - bytesOf(key, current));
+            touch(successor);
             return respSerializer.respInteger(incremented);
         }finally{
             keyLock.unlock();
@@ -208,9 +284,12 @@ public class Store {
             if(value.expiry.isBefore(now)){
                 // remove this exact entry: a set that lands between the read and here must
                 // not have its fresh value dropped by the cleanup
-                map.remove(key, value);
+                if (map.remove(key, value)) {
+                    datasetBytes.addAndGet(-bytesOf(key, value));
+                }
                 return "$-1\r\n";
             }
+            touch(value);
             return respSerializer.serializeBulkString(value.val);
         } catch (Exception e) {
             logger.log(Level.SEVERE, e.getMessage());
@@ -227,9 +306,12 @@ public class Store {
             Value value = map.getOrDefault(key, null);
 
             if(value != null && value.expiry.isBefore(now)){
-                map.remove(key, value);
+                if (map.remove(key, value)) {
+                    datasetBytes.addAndGet(-bytesOf(key, value));
+                }
                 return null;
             }
+            touch(value);
             return value;
         } catch (Exception e) {
             logger.log(Level.SEVERE, e.getMessage());
@@ -269,10 +351,13 @@ public class Store {
         Value value = map.get(key);
         if (value == null) return null;
         if (value.expiry.isBefore(now)) {
-            map.remove(key, value);
+            if (map.remove(key, value)) {
+                datasetBytes.addAndGet(-bytesOf(key, value));
+            }
             return null;
         }
         if (value.expiry.equals(LocalDateTime.MAX)) return -1L;
+        touch(value);
         return Duration.between(now, value.expiry).toMillis();
     }
 
@@ -330,14 +415,21 @@ public class Store {
                 if (value == null) return 0;
                 LocalDateTime now = LocalDateTime.now();
                 if (value.expiry.isBefore(now)) {
-                    map.remove(key, value);
+                    if (map.remove(key, value)) {
+                        datasetBytes.addAndGet(-bytesOf(key, value));
+                    }
                     return 0;
                 }
                 if (exp == null || !exp.isAfter(now)) {
-                    map.remove(key, value);
+                    if (map.remove(key, value)) {
+                        datasetBytes.addAndGet(-bytesOf(key, value));
+                    }
                     return 1;
                 }
-                map.put(key, new Value(value.val, value.created, exp));
+                Value successor = new Value(value.val, value.created, exp);
+                map.put(key, successor);
+                datasetBytes.addAndGet(bytesOf(key, successor) - bytesOf(key, value));
+                touch(successor);
                 return 1;
             } finally {
                 rwLock.writeLock().unlock();
@@ -357,11 +449,16 @@ public class Store {
                 if (value == null) return 0;
                 LocalDateTime now = LocalDateTime.now();
                 if (value.expiry.isBefore(now)) {
-                    map.remove(key, value);
+                    if (map.remove(key, value)) {
+                        datasetBytes.addAndGet(-bytesOf(key, value));
+                    }
                     return 0;
                 }
                 if (value.expiry.equals(LocalDateTime.MAX)) return 0;
-                map.put(key, new Value(value.val, value.created, LocalDateTime.MAX));
+                Value successor = new Value(value.val, value.created, LocalDateTime.MAX);
+                map.put(key, successor);
+                datasetBytes.addAndGet(bytesOf(key, successor) - bytesOf(key, value));
+                touch(successor);
                 return 1;
             } finally {
                 rwLock.writeLock().unlock();
@@ -429,20 +526,28 @@ public class Store {
         LocalDateTime now = LocalDateTime.now();
         ConcurrentHashMap<String, Value> fresh = new ConcurrentHashMap<>(
                 Math.max(16, entries.size() * 2));
+        long bytes = 0;
         for (StoreSnapshot.Entry entry : entries) {
             if (entry.deadlineEpochMillis() == null) {
-                fresh.put(entry.key(), new Value(entry.value(), now, LocalDateTime.MAX));
+                Value value = new Value(entry.value(), now, LocalDateTime.MAX);
+                fresh.put(entry.key(), value);
+                bytes += bytesOf(entry.key(), value);
             } else {
                 LocalDateTime expiry = LocalDateTime.ofInstant(
                         Instant.ofEpochMilli(entry.deadlineEpochMillis()), ZoneId.systemDefault());
                 if (!expiry.isBefore(now)) {
-                    fresh.put(entry.key(), new Value(entry.value(), now, expiry));
+                    Value value = new Value(entry.value(), now, expiry);
+                    fresh.put(entry.key(), value);
+                    bytes += bytesOf(entry.key(), value);
                 }
             }
         }
         rwLock.writeLock().lock();
         try {
             this.map = fresh;
+            // the swapped map is what the store counts from now on: the old bytes are gone
+            // with the old map, and the new ones are the sum of the entries that landed
+            datasetBytes.set(bytes);
         } finally {
             rwLock.writeLock().unlock();
         }
@@ -468,8 +573,8 @@ public class Store {
                 rwLock.writeLock().lock();
                 try {
                     Value v = map.get(k);
-                    if (v != null && v.expiry.isBefore(now)) {
-                        map.remove(k, v);
+                    if (v != null && v.expiry.isBefore(now) && map.remove(k, v)) {
+                        datasetBytes.addAndGet(-bytesOf(k, v));
                     }
                 } finally {
                     rwLock.writeLock().unlock();
@@ -492,6 +597,29 @@ public class Store {
             Client client,
             BiFunction<String[], Map<String, Value>, String> transactionCacheApplier
     ){
+        executeTransaction(client, transactionCacheApplier, null);
+    }
+
+    /**
+     * Applies a whole transaction, or refuses it whole.
+     *
+     * <p>The queued commands are applied to a private view first, so the replies are known
+     * before anything is committed. When an {@code admission} is given it is asked once,
+     * against that finished view, whether the resulting keyspace would fit the memory
+     * limit. A refusal commits nothing and answers the transaction with the error the
+     * admission returned: a transaction is admitted as a unit or not at all, because
+     * partially applying it to make it fit would leave a state no command asked for. A
+     * {@code null} admission admits everything, which is what a store without a limit asks
+     * for.</p>
+     *
+     * @return the error the admission refused with, or {@code null} when the transaction
+     *         committed
+     */
+    public String executeTransaction(
+            Client client,
+            BiFunction<String[], Map<String, Value>, String> transactionCacheApplier,
+            Function<Map<String, Value>, String> admission
+    ){
         Map<String, Value> localCache = new HashMap<>();
         List<String> responses = new ArrayList<>();
         // Every key this transaction touches is held for the whole apply and commit. A
@@ -512,18 +640,33 @@ public class Store {
             }
             //control will only come here when the queue is empty, that means no other commands in the transaction left to be applied
 
+            if(admission != null){
+                String error = admission.apply(localCache);
+                if(error != null){
+                    // the whole transaction is refused: nothing is committed and no reply
+                    // is recorded, so the caller answers EXEC with this error
+                    return error;
+                }
+            }
+
             for(Map.Entry<String, Value> entry : localCache.entrySet()){
                 String key = entry.getKey();
                 Value value = entry.getValue();
 
                 if(value.isDeletedInTransaction){
-                    this.map.remove(key);
+                    Value removed = this.map.remove(key);
+                    if(removed != null){
+                        datasetBytes.addAndGet(-bytesOf(key, removed));
+                    }
                 }else{
-                    this.map.put(key, value);
+                    Value previous = this.map.put(key, value);
+                    datasetBytes.addAndGet(bytesOf(key, value) - (previous == null ? 0 : bytesOf(key, previous)));
+                    touch(value);
                 }
             }
 
             client.transactionResponse.addAll(responses);
+            return null;
         }finally {
             rwLock.writeLock().unlock();
             for(int i = held.size() - 1; i >= 0; i--){

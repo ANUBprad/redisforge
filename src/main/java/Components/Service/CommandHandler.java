@@ -177,12 +177,14 @@ public class CommandHandler {
             return switch (command[1].toLowerCase(Locale.ROOT)) {
                 case "replication" -> respSerializer.serializeBulkString(replicationInfo());
                 case "server" -> respSerializer.serializeBulkString(serverInfo());
+                case "memory" -> respSerializer.serializeBulkString(memoryInfo());
                 case "all" -> respSerializer.serializeBulkString(
-                        serverInfo() + "\r\n" + replicationInfo());
+                        serverInfo() + "\r\n" + replicationInfo() + "\r\n" + memoryInfo());
                 default -> "-ERR Invalid INFO section specified\r\n";
             };
         }
-        return respSerializer.serializeBulkString(serverInfo() + "\r\n" + replicationInfo());
+        return respSerializer.serializeBulkString(
+                serverInfo() + "\r\n" + replicationInfo() + "\r\n" + memoryInfo());
     }
 
     private String serverInfo() {
@@ -195,6 +197,40 @@ public class CommandHandler {
         String masterReplOffset = "master_repl_offset:" + redisConfig.getMasterReplOffset();
         return "# Replication\r\n" + String.join("\r\n",
                 new String[]{role, masterReplId, masterReplOffset});
+    }
+
+    /**
+     * The memory section: how many bytes the keyspace is charged, the ceiling the server
+     * was given, the policy it evicts under, and how many keys that policy has removed.
+     * The numbers are the same logical estimate the eviction decision uses, so a client
+     * reading {@code used_memory} sees the quantity {@code maxmemory} is compared against.
+     */
+    private String memoryInfo() {
+        long used = store.currentBytes();
+        long max = redisConfig.getMaxmemory();
+        return "# Memory\r\n" + String.join("\r\n", new String[]{
+                "used_memory:" + used,
+                "used_memory_human:" + humanBytes(used),
+                "maxmemory:" + max,
+                "maxmemory_human:" + humanBytes(max),
+                "maxmemory_policy:" + redisConfig.getMaxmemoryPolicy().configName(),
+                "evicted_keys:" + store.evictedKeys()
+        });
+    }
+
+    /** A byte count in the approximate form Redis prints, such as {@code 1.00M}. */
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + "B";
+        }
+        String[] units = {"K", "M", "G", "T", "P"};
+        double value = bytes;
+        int unit = -1;
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024;
+            unit++;
+        }
+        return String.format(Locale.ROOT, "%.2f%s", value, units[unit]);
     }
 
     public String replconf(String[] command, Client client) {

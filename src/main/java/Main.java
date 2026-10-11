@@ -61,6 +61,17 @@ public class Main {
                     // 0 disables the limit
                     redisConfig.setClientTimeoutMs(Math.multiplyExact(Integer.parseInt(args[i+1]), 1000));
                     break;
+                case "--maxmemory":
+                    // the ceiling on the estimated bytes of the keyspace, in bytes;
+                    // 0 means no limit
+                    redisConfig.setMaxmemory(Long.parseLong(args[i+1]));
+                    break;
+                case "--maxmemory-policy":
+                    // how a write past the ceiling is admitted: one of noeviction,
+                    // allkeys-lru, allkeys-random, volatile-lru, volatile-random,
+                    // volatile-ttl. An unknown name stops the server here
+                    redisConfig.setMaxmemoryPolicy(args[i+1]);
+                    break;
             }
         }
 

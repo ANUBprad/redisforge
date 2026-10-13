@@ -280,7 +280,7 @@ image you published.
 
 ### Master
 
-`PING`, `ECHO`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO`
+`PING`, `ECHO`, `DEL`, `SET`, `GET`, `INCR`, `MULTI`, `EXEC`, `DISCARD`, `INFO`
 (sections `server`, `replication`, `memory`, `all`), `REPLCONF`, `PSYNC`, `WAIT`,
 `BGREWRITEAOF`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
@@ -293,7 +293,10 @@ Lists: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LR
 Sets: `SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS`, `SPOP`,
 `SRANDMEMBER`
 
-`DEL` is only handled inside a transaction. See
+`DEL` removes each named key whatever it holds, inside and outside a transaction, and
+answers with the number of keys it actually removed: a key that is not there is skipped,
+not counted, and not an error. A `DEL` that removed nothing changes nothing and is
+neither written to the append-only file nor passed to replicas. See
 [Hashes, lists and sets](#hashes-lists-and-sets) for the semantics.
 
 `EXPIRE` / `PEXPIRE` answer `:1` when the deadline was set (or the key removed, for a

@@ -514,7 +514,9 @@ public class SlaveTcpServer {
             logger.log(Level.WARNING, "ignored a DEL with no key: " + String.join(" ", command));
             return;
         }
-        store.delete(command[1]);
+        for (int i = 1; i < command.length; i++) {
+            store.delete(command[i]);
+        }
         passOn(command);
     }
 

@@ -362,6 +362,34 @@ public class MasterTcpServer {
             case "ECHO":
                 res = commandHandler.echo(command);
                 break;
+            case "DEL":
+                // Redis deletes every named key that exists and answers with how many it
+                // removed: a key that is not there is skipped, not an error. The store
+                // change, its recording and its propagation happen as one step under the
+                // backlog lock, like every other write. A delete only frees bytes, so it
+                // needs no admission and can never be refused by a memory limit; nothing
+                // is written down or passed on when no key was removed, because there was
+                // no change to describe.
+                if (command.length < 2) {
+                    res = commandHandler.wrongNumberOfArguments("del");
+                    break;
+                }
+                synchronized (redisConfig.getReplicationBacklog()) {
+                    res = appendOnlyPersistence.locked(() -> {
+                        int deleted = 0;
+                        for (int i = 1; i < command.length; i++) {
+                            if (store.delete(command[i])) {
+                                deleted++;
+                            }
+                        }
+                        if (deleted > 0) {
+                            appendOnlyPersistence.appendApplied(command);
+                            propagate(command);
+                        }
+                        return respSerializer.respInteger(deleted);
+                    });
+                }
+                break;
             case "SET":
                 // one hold of the backlog lock around apply, record and propagate, for the
                 // same reason an increment takes one: the store and the stream cannot come

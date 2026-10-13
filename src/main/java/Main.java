@@ -41,8 +41,11 @@ public class Main {
             // connect already sees the recovered dataset. A file that cannot be trusted
             // stops the server here instead of starting up with a dataset nobody asked for.
             appendOnly.start();
-            // the file is flushed and closed on the way out, including on a signal
-            Runtime.getRuntime().addShutdownHook(new Thread(appendOnly::close, "appendonly-shutdown"));
+            // one hook for the whole master and one ordering: the listener stops first so
+            // no handler keeps writing, and only then is the append only file flushed and
+            // closed. This is the same action @PreDestroy runs, and it is idempotent, so a
+            // signal and a context close cannot double-close or race each other
+            Runtime.getRuntime().addShutdownHook(new Thread(master::shutdown, "master-shutdown"));
             master.startServer();
         }
     }

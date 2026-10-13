@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,6 +53,14 @@ public class AppendOnlyPersistence {
 
     /** How often the everysec policy forces pending writes to disk. */
     private static final long FSYNC_PERIOD_SECONDS = 1;
+
+    /**
+     * How many consecutive writes that move no bytes are tolerated before a write is
+     * declared stuck. A channel that keeps reporting zero progress is not draining
+     * anything, so spinning on it forever would hang a client; this is high enough that
+     * a channel making slow but real progress is never mistaken for a stuck one.
+     */
+    static final int MAX_STALLED_WRITES = 64;
 
     private final RedisConfig redisConfig;
     private final Store store;
@@ -211,6 +220,16 @@ public class AppendOnlyPersistence {
      * one, forced whole, and only then moved over it in a single step, so a failure at any
      * point leaves the file that was already there.
      *
+     * <p>The step is a single {@link StandardCopyOption#ATOMIC_MOVE} on purpose: a half
+     * swapped file is worse than no rewrite at all. This is deliberately not softened into
+     * a non-atomic fallback, because a deletion followed by a copy has a window where the
+     * file is missing or partial, and a crash in that window loses the dataset. The price
+     * is that the move has to be supported by the filesystem: a network share that refuses
+     * an atomic rename (for example an Azure Files SMB mount) makes this throw
+     * {@link java.nio.file.AtomicMoveNotSupportedException} rather than degrade quietly, so
+     * a deployment that needs rewriting on such a share has to fix the share instead of
+     * trusting a fallback here.
+     *
      * @return the number of keys the rewritten file describes
      */
     public int rewrite() {
@@ -271,7 +290,7 @@ public class AppendOnlyPersistence {
         try (FileChannel out = FileChannel.open(temp, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             for (String[] frame : snapshot) {
-                out.write(ByteBuffer.wrap(
+                writeFully(out, ByteBuffer.wrap(
                         respSerializer.respArray(frame).getBytes(StandardCharsets.UTF_8)));
             }
             // the bytes have to be on disk before the move announces them: a rename says
@@ -394,12 +413,37 @@ public class AppendOnlyPersistence {
     /** Writes one entry, flushing it when the policy asks for that. */
     private void append(String resp) {
         try {
-            channel.write(ByteBuffer.wrap(resp.getBytes(StandardCharsets.UTF_8)));
+            writeFully(channel, ByteBuffer.wrap(resp.getBytes(StandardCharsets.UTF_8)));
             if (policy == FsyncPolicy.ALWAYS) {
                 channel.force(false);
             }
         } catch (IOException e) {
             throw new UncheckedIOException("could not append to the append only file", e);
+        }
+    }
+
+    /**
+     * Writes the whole buffer, looping until every byte is handed to the channel.
+     *
+     * <p>A single {@code write} returning a short count or zero is not a failure: a
+     * channel may accept only part of a buffer, or none of it, and the caller has to
+     * try again. Ignoring the count would silently drop the tail of a frame, which
+     * would leave a half written command on disk for replay to choke on. The loop
+     * ends when the buffer is drained, and a run of writes that move no bytes at all
+     * ends as an exception instead of a spin that never returns.
+     */
+    static void writeFully(WritableByteChannel channel, ByteBuffer buffer) throws IOException {
+        int stalled = 0;
+        while (buffer.hasRemaining()) {
+            int written = channel.write(buffer);
+            if (written > 0) {
+                stalled = 0;
+                continue;
+            }
+            if (++stalled >= MAX_STALLED_WRITES) {
+                throw new IOException("the append only file accepted no bytes in "
+                        + stalled + " consecutive writes");
+            }
         }
     }
 

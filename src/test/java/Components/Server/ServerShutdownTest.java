@@ -217,9 +217,31 @@ class ServerShutdownTest {
     }
 
     @Test
+    void shuttingDownClosesTheWholeMasterAndIsHarmlessTwice() throws Exception {
+        // shutdown is what a signal runs: stop serving, then close the append only file.
+        // A hook and a context close can both reach it, so a second call must not break
+        // anything and the server must still be startable afterwards
+        masterTcpServer.shutdown();
+        masterTcpServer.shutdown();
+
+        assertEquals(0, masterTcpServer.activeClientHandlers(), "a handler outlived the shutdown");
+        await(cleanRegistry(), "a shut down master still holds a connection");
+
+        redisConfig.setPort(masterPort);
+        CompletableFuture.runAsync(masterTcpServer::startServer);
+        awaitPortOpen(masterPort);
+
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("PING"));
+            assertEquals("+PONG\r\n", client.readReply(),
+                    "the master could not start after a shutdown");
+        }
+    }
+
+    @Test
     void bothServersCarryTheShutdownAnnotationSpringCalls() throws NoSuchMethodException {
-        // @PreDestroy is how a context close reaches stop(); without it the server would
-        // outlive its application
+        // @PreDestroy is how a context close reaches the whole shutdown, stop serving and
+        // close the file; without it the server would outlive its application
         assertNotNull(MasterTcpServer.class.getMethod("shutdown").getAnnotation(PreDestroy.class),
                 "the master's shutdown is not wired to the context closing");
         assertNotNull(SlaveTcpServer.class.getMethod("shutdown").getAnnotation(PreDestroy.class),

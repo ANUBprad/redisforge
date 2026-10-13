@@ -6,7 +6,12 @@ import Components.Service.RespSerializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.WritableByteChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZoneId;
@@ -484,6 +489,80 @@ class AppendOnlyPersistenceTest {
         assertThrows(IllegalArgumentException.class, () -> FsyncPolicy.parse(null));
     }
 
+    @Test
+    void closingAnAlreadyClosedFileChangesNothing(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "everysec"), store);
+
+        aof.appendApplied(new String[]{"SET", "k", "v"});
+        aof.close();
+        // a shutdown hook and a Spring context close can both reach close(), so a second
+        // call has to be a no-op rather than a second close of an already closed channel
+        aof.close();
+        assertFalse(aof.isEnabled(), "closing twice reopened or left the file open");
+
+        Store replayed = replay(file);
+        assertEquals("v", replayed.getValue("k").val, "the second close disturbed the file");
+    }
+
+    @Test
+    void writeFullyLoopsUntilEveryByteIsOut() throws Exception {
+        byte[] payload = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".getBytes(StandardCharsets.UTF_8);
+        // a channel that accepts the buffer one byte at a time, never the whole frame
+        DripChannel channel = new DripChannel(1);
+
+        AppendOnlyPersistence.writeFully(channel, ByteBuffer.wrap(payload));
+
+        assertArrayEquals(payload, channel.written(),
+                "the helper stopped before the whole frame was handed over");
+    }
+
+    @Test
+    void writeFullyGivesUpOnAChannelThatNeverAcceptsBytes() {
+        StuckChannel channel = new StuckChannel();
+
+        IOException e = assertThrows(IOException.class, () ->
+                AppendOnlyPersistence.writeFully(channel, ByteBuffer.wrap(new byte[]{1, 2, 3})));
+
+        assertTrue(e.getMessage().contains("no bytes"),
+                "the refusal does not say what was wrong: " + e.getMessage());
+        assertEquals(AppendOnlyPersistence.MAX_STALLED_WRITES, channel.calls,
+                "the helper did not stop at the stall limit, so it would spin forever");
+    }
+
+    @Test
+    void aRewriteThatCannotBuildItsTempFileLeavesTheOriginalUntouched(@TempDir Path dir)
+            throws Exception {
+        Path file = dir.resolve("appendonly.aof");
+        Store store = newStore();
+        AppendOnlyPersistence aof = started(masterConfig(file, "always"), store);
+
+        store.set("k", "v");
+        aof.appendApplied(new String[]{"SET", "k", "v"});
+        String before = Files.readString(file);
+
+        // a directory sitting where the rewrite wants to build its temp file: opening it
+        // as a file fails, which fails the rewrite before it can touch the original
+        Files.createDirectory(dir.resolve("appendonly.aof.rewrite"));
+
+        assertThrows(UncheckedIOException.class, aof::rewrite);
+        assertEquals(before, Files.readString(file),
+                "a failed rewrite changed the file it was replacing");
+        assertTrue(aof.isEnabled(), "a failed rewrite closed the live file");
+
+        // the live file still takes writes, and a later rewrite, with the temp path free
+        // again, still produces a file that describes everything
+        store.set("after", "v");
+        aof.appendApplied(new String[]{"SET", "after", "v"});
+        assertEquals(2, aof.rewrite(), "the rewrite could not recover from the failed attempt");
+        aof.close();
+
+        Store replayed = replay(file);
+        assertEquals("v", replayed.getValue("k").val, "the rewrite lost a key written before it failed");
+        assertEquals("v", replayed.getValue("after").val, "the rewrite lost a key written after it failed");
+    }
+
     private Store newStore() {
         Store store = new Store();
         store.respSerializer = respSerializer;
@@ -536,6 +615,60 @@ class AppendOnlyPersistenceTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** A channel that accepts at most {@code perWrite} bytes per call, like a short write. */
+    private static final class DripChannel implements WritableByteChannel {
+        private final int perWrite;
+        private final ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        private boolean open = true;
+
+        private DripChannel(int perWrite) {
+            this.perWrite = perWrite;
+        }
+
+        @Override
+        public int write(ByteBuffer src) {
+            int count = Math.min(perWrite, src.remaining());
+            byte[] chunk = new byte[count];
+            src.get(chunk);
+            sink.write(chunk, 0, count);
+            return count;
+        }
+
+        @Override
+        public boolean isOpen() {
+            return open;
+        }
+
+        @Override
+        public void close() {
+            open = false;
+        }
+
+        private byte[] written() {
+            return sink.toByteArray();
+        }
+    }
+
+    /** A channel that never accepts a byte, the case the stall guard exists for. */
+    private static final class StuckChannel implements WritableByteChannel {
+        private int calls;
+
+        @Override
+        public int write(ByteBuffer src) {
+            calls++;
+            return 0;
+        }
+
+        @Override
+        public boolean isOpen() {
+            return true;
+        }
+
+        @Override
+        public void close() {
         }
     }
 }

@@ -108,9 +108,16 @@ public class MasterTcpServer {
         return listener.activeClientHandlers();
     }
 
+    /**
+     * The whole master shutdown: stop serving, then flush and close the append only
+     * file. Closing the file last means every write that was already accepted is on
+     * disk before the channel goes away. Idempotent, so a shutdown hook and a Spring
+     * context close can both run it without double-closing or racing each other.
+     */
     @PreDestroy
     public void shutdown() {
         stop();
+        appendOnlyPersistence.close();
     }
 
     private void handleClient(Client client) throws IOException {

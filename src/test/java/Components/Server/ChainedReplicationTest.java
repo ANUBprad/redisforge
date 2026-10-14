@@ -28,8 +28,10 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -857,6 +859,13 @@ class ChainedReplicationTest {
         private final OutputStream out;
         private byte[] buffered = new byte[0];
         private int filled;
+        /**
+         * Frames that were whole in the buffer but not yet handed out. A single read can
+         * carry more than one whole frame - a propagated write and the GETACK that follows
+         * it, for instance - so a reader that only returned the first would silently drop
+         * the rest and then block for a frame that had already arrived.
+         */
+        private final Deque<String[]> pendingFrames = new ArrayDeque<>();
 
         RespSocket(int port) throws IOException {
             this(port, -1);
@@ -923,15 +932,9 @@ class ChainedReplicationTest {
             return payload;
         }
 
-        /** Reads the next whole frame the replica sent. */
+        /** Reads the next whole frame the replica sent, in the order it was sent. */
         String[] readFrame() throws IOException {
-            while (true) {
-                List<String[]> frames = takeWholeFrames();
-                if (!frames.isEmpty()) {
-                    return frames.get(0);
-                }
-                fill();
-            }
+            return nextFrame();
         }
 
         /** Reads the next replication control frame, stepping over propagated writes. */
@@ -953,15 +956,28 @@ class ChainedReplicationTest {
             List<String[]> frames = new ArrayList<>();
             send(frame("REPLCONF", "GETACK", "*"));
             while (true) {
-                for (String[] command : takeWholeFrames()) {
-                    frames.add(command);
-                    if (command[0].equalsIgnoreCase("REPLCONF") && command[1].equalsIgnoreCase("ACK")) {
-                        frames.remove(frames.size() - 1);
-                        return frames;
-                    }
+                String[] command = nextFrame();
+                if (command[0].equalsIgnoreCase("REPLCONF") && command[1].equalsIgnoreCase("ACK")) {
+                    return frames;
+                }
+                frames.add(command);
+            }
+        }
+
+        /**
+         * The next whole frame, whether it was already buffered or has to be read. Every
+         * whole frame a read uncovers is kept, so nothing between two frames is ever lost.
+         */
+        private String[] nextFrame() throws IOException {
+            while (pendingFrames.isEmpty()) {
+                List<String[]> frames = takeWholeFrames();
+                if (!frames.isEmpty()) {
+                    pendingFrames.addAll(frames);
+                    break;
                 }
                 fill();
             }
+            return pendingFrames.pollFirst();
         }
 
         /** Returns "" when the replica sends nothing at all, which some replies are. */

@@ -4,6 +4,35 @@ A Redis-compatible in-memory server written in Java 23, speaking the RESP protoc
 over TCP. RedisForge implements the core Redis command set along with transactions
 and asynchronous master/replica replication.
 
+## Source layout
+
+The code is grouped by responsibility under the standard Maven source tree:
+
+```text
+src/
+  main/java/com/redisforge/
+    Main.java
+    command/       Command dispatch and command semantics
+    config/        Spring wiring
+    network/       Client connection primitives
+    persistence/   Append-only file, replay and fsync policy
+    protocol/      RESP framing, parsing and replies
+    replication/   Replica links and replication backlog
+    server/        Master/replica listeners and runtime options
+    store/         Key/value state, typed values, expiry and memory policy
+  test/java/com/redisforge/
+    benchmark/     Standalone benchmark harness
+    persistence/   AOF recovery tests
+    protocol/      RESP tests
+    replication/   Replication backlog tests
+    server/        Socket, command, concurrency and replication tests
+    store/         Store, typed-value and memory tests
+```
+
+The package names and directory names match, so classes can be found by their domain
+rather than through a generic `Components` bucket. Tests follow the same package boundaries
+as the code they exercise.
+
 ## Features
 
 - RESP protocol over a plain TCP socket
@@ -200,7 +229,7 @@ hash, list or set, and the typed reads do the same against a string.
 
 ## Benchmark
 
-[`src/test/java/Components/Benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
+[`src/test/java/com/redisforge/benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
 is a plain-JDK harness in the test tree that hammers a RedisForge server that is already
 up. It is deliberately not a JUnit test, so `mvn test` does not run it. Point it at a
 running server:

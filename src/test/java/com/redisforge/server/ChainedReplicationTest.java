@@ -1,0 +1,1029 @@
+package com.redisforge.server;
+
+import com.redisforge.network.Client;
+import com.redisforge.server.ConnectionPool;
+import com.redisforge.replication.ReplicationBacklog;
+import com.redisforge.replication.Slave;
+import com.redisforge.persistence.AppendOnlyPersistence;
+import com.redisforge.store.Store;
+import com.redisforge.protocol.RespSerializer;
+import com.redisforge.config.AppConfig;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.annotation.DirtiesContext;
+
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/**
+ * A replica that can be the upstream master of another replica. The downstream replica
+ * runs the same handshake against it (PING, REPLCONF listening-port, REPLCONF capa,
+ * PSYNC), registers itself as a slave, and then receives the writes this replica applies.
+ * These tests play that downstream replica over a real socket and drive this replica's
+ * own upstream with a scripted byte stream, so both hops are exercised deterministically.
+ *
+ * <p>The project's PSYNC hands a downstream replica the snapshot of the dataset this hop
+ * already holds, followed by the writes that happen after the snapshot was cut. A downstream
+ * replica that attaches thus catches what was applied before it connected, instead of
+ * starting from nothing. These tests read the snapshot off the socket, and then watch the
+ * writes that come after it.</p>
+ */
+@SpringBootTest(classes = AppConfig.class)
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+class ChainedReplicationTest {
+
+    private static final long AWAIT_TIMEOUT_MS = 10_000;
+    private static final long NOTHING_EXPECTED_MS = 300;
+
+    @Autowired
+    private SlaveTcpServer slaveTcpServer;
+    @Autowired
+    private ConnectionPool connectionPool;
+    @Autowired
+    private RedisConfig redisConfig;
+    @Autowired
+    private Store store;
+    @Autowired
+    private RespSerializer respSerializer;
+    @Autowired
+    private AppendOnlyPersistence appendOnlyPersistence;
+
+    private int replicaPort;
+    private Path replicaAppendOnlyFile;
+
+    @BeforeAll
+    void startReplica() throws Exception {
+        replicaPort = freePort();
+        // the upstream handshake is pointed at a closed port so it gives up at once; these
+        // tests feed the upstream stream in directly instead
+        redisConfig.setRole("slave");
+        redisConfig.setPort(replicaPort);
+        redisConfig.setMasterHost("127.0.0.1");
+        redisConfig.setMasterPort(freePort());
+        // pointed at a path that must never appear, to catch a replica that wrote a file
+        replicaAppendOnlyFile = Files.createTempDirectory("chained-replica-aof")
+                .resolve("appendonly.aof");
+        Files.deleteIfExists(replicaAppendOnlyFile);
+        redisConfig.setAppendonly(true);
+        redisConfig.setAppendfilename(replicaAppendOnlyFile.toString());
+        // one server for the whole class, on a thread of its own: startServer never
+        // returns, so a server per test would pile up accept loops on the common pool and
+        // starve the other test classes that start their servers the same way
+        Thread server = new Thread(slaveTcpServer::startServer, "chained-replication-replica");
+        server.setDaemon(true);
+        server.start();
+        awaitPortOpen(replicaPort);
+    }
+
+    @BeforeEach
+    void resetReplicaState() throws Exception {
+        await(() -> connectionPool.getSlaves().isEmpty(), "a replica from an earlier test is still registered");
+        connectionPool.resetCaughtUpAccounting();
+        redisConfig.setMasterReplOffset(0L);
+    }
+
+    @Test
+    void replconfListeningPortRegistersTheReplicaAndAnswersOk() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            downstream.send(frame("REPLCONF", "listening-port", "" + replicaPort));
+
+            assertEquals("+OK", downstream.readReply());
+            await(() -> connectionPool.getSlaves().size() == 1, "the connection was not registered as a replica");
+            assertTrue(connectionPool.getClients().isEmpty(),
+                    "a connection that registered itself as a replica is still held as a plain client");
+        }
+    }
+
+    @Test
+    void replconfCapaPsync2IsAcceptedAndRecorded() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            registerOnly(downstream);
+
+            downstream.send(frame("REPLCONF", "capa", "psync2"));
+
+            assertEquals("+OK", downstream.readReply());
+            Slave registered = awaitSlave();
+            assertTrue(registered.capabilities.contains("psync2"),
+                    "the capability was not recorded: " + registered.capabilities);
+        }
+    }
+
+    @Test
+    void replconfAckMatchingTheStreamCountsTheReplicaAsCaughtUp() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            connectionPool.resetCaughtUpAccounting();
+            redisConfig.setMasterReplOffset(42L);
+
+            downstream.send(frame("REPLCONF", "ACK", "42"));
+
+            await(() -> connectionPool.slavesThatAreCaughtUp.get() == 1,
+                    "an ACK that matches the bytes sent did not count the replica as caught up");
+            assertEquals("", downstream.expectNothing(),
+                    "an ACK is consumed, it is not answered");
+        }
+    }
+
+    @Test
+    void replconfAckThatDoesNotMatchTheStreamCountsNothing() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            connectionPool.resetCaughtUpAccounting();
+            redisConfig.setMasterReplOffset(42L);
+
+            downstream.send(frame("REPLCONF", "ACK", "7"));
+
+            assertEquals("", downstream.expectNothing());
+            assertEquals(0, connectionPool.slavesThatAreCaughtUp.get(),
+                    "an ACK below what was sent counted the replica as caught up");
+        }
+    }
+
+    @Test
+    void replconfGetackIsAnsweredWithTheCurrentOffset() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            redisConfig.setMasterReplOffset(1234L);
+
+            downstream.send(frame("REPLCONF", "GETACK", "*"));
+
+            assertArrayEquals(new String[]{"REPLCONF", "ACK", "1234"}, downstream.readFrame());
+        }
+    }
+
+    @Test
+    void replicaCompletesTheHandshakeOfADownstreamReplica() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            downstream.send(frame("PING"));
+            assertEquals("+PONG", downstream.readReply());
+
+            downstream.send(frame("REPLCONF", "listening-port", "" + replicaPort));
+            assertEquals("+OK", downstream.readReply());
+            downstream.send(frame("REPLCONF", "capa", "psync2"));
+            assertEquals("+OK", downstream.readReply());
+
+            downstream.send(frame("PSYNC", "?", "-1"));
+
+            String status = downstream.readLine();
+            assertTrue(status.startsWith("+FULLRESYNC "), "no FULLRESYNC for the downstream replica: " + status);
+            int declaredLength = Integer.parseInt(downstream.readLine().substring(1));
+            assertTrue(declaredLength > 0, "FULLRESYNC declared an empty payload");
+            byte[] payload = downstream.readExactly(declaredLength);
+            assertEquals("RFSS", new String(payload, 0, 4, StandardCharsets.UTF_8),
+                    "the dataset snapshot did not arrive whole");
+            // the payload is counted off rather than scanned for a delimiter, so the bytes
+            // after it are the start of a streamed command and nothing else
+            assertEquals("", downstream.expectNothing(),
+                    "something followed the snapshot payload that was not a streamed command");
+            await(() -> connectionPool.getSlaves().size() == 1,
+                    "the downstream replica was not registered as a slave");
+        }
+    }
+
+    @Test
+    void replicaStreamsUpstreamWritesDownstreamInOrder() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:order");
+
+            // enough writes that propagation on its own task per write would not keep them
+            // in step, and the whole batch arrives in one read, as a master floods a replica
+            List<String> values = new ArrayList<>();
+            ByteArrayOutputStream upstream = new ByteArrayOutputStream();
+            for (int i = 0; i < 60; i++) {
+                String value = "value-" + i;
+                values.add(value);
+                upstream.writeBytes(frame("SET", "chain:order", value));
+            }
+            feed(upstream.toByteArray());
+
+            List<String[]> received = downstream.readFramesUntilAck();
+
+            assertEquals(values.size(), received.size(), "the downstream replica did not get every write");
+            for (int i = 0; i < values.size(); i++) {
+                assertArrayEquals(new String[]{"SET", "chain:order", values.get(i)}, received.get(i),
+                        "write " + i + " did not arrive in the order it was applied");
+            }
+            assertEquals(values.get(values.size() - 1), store.getValue("chain:order").val);
+        }
+    }
+
+    @Test
+    void downstreamReplicaGetsSpecialValuesLargeValuesAndPipelinedWritesIntact() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:special");
+
+            String large = "v".repeat(1024 * 1024);
+            // CRLF and RESP punctuation inside a payload, spaces, and an empty value are
+            // what a hand written parser mangles
+            List<String[]> commands = List.of(
+                    new String[]{"SET", "chain:special", "line1\r\nline2"},
+                    new String[]{"SET", "chain:special", "*2\r\n$5\r\nhello"},
+                    new String[]{"SET", "chain:special", "  padded  "},
+                    new String[]{"SET", "chain:special", ""},
+                    new String[]{"SET", "chain:special", large});
+
+            ByteArrayOutputStream upstream = new ByteArrayOutputStream();
+            for (String[] command : commands) {
+                upstream.writeBytes(frame(command));
+            }
+            // all of them pipelined, cut across two reads so a frame has to be carried over
+            byte[] all = upstream.toByteArray();
+            feed(Arrays.copyOfRange(all, 0, 37), Arrays.copyOfRange(all, 37, all.length));
+
+            List<String[]> received = downstream.readFramesUntilAck();
+
+            assertEquals(commands.size(), received.size());
+            for (int i = 0; i < commands.size(); i++) {
+                assertArrayEquals(commands.get(i), received.get(i),
+                        "the downstream replica got something else for write " + i);
+            }
+            assertEquals(large, store.getValue("chain:special").val);
+        }
+    }
+
+    @Test
+    void waitCountsTheDownstreamReplicaThatAcknowledged() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            byte[] write = frame("SET", "chain:wait", "acknowledged");
+            feed(write);
+
+            // WAIT asks the downstream replica for its offset the way a master does. The
+            // existing semantics are simplified: every replica that reports back exactly
+            // the number of write bytes it was sent counts as one, and the count is reset
+            // after each WAIT.
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "5000"));
+
+                String[] getack = downstream.readControlFrame();
+                assertArrayEquals(new String[]{"REPLCONF", "GETACK", "*"}, getack);
+                // the downstream replica has received exactly the one write so far
+                downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+
+                assertEquals(":1", client.readReply(), "the downstream replica was not counted by WAIT");
+            }
+            assertEquals(0, connectionPool.slavesThatAreCaughtUp.get(), "the caught up count was not reset");
+
+            // a downstream replica that does not answer counts for nothing
+            feed(frame("SET", "chain:wait", "unanswered"));
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "150"));
+                assertEquals(":0", client.readReply());
+            }
+        }
+    }
+
+    @Test
+    void aReplicaCountsOnceForAWaitNoMatterHowOftenItAcknowledges() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            byte[] write = frame("SET", "chain:wait:twice", "acknowledged");
+            feed(write);
+
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "5000"));
+                downstream.readControlFrame();
+                downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+                assertEquals(":1", client.readReply(), "the replica that acknowledged was not counted");
+            }
+
+            // the same replica acknowledging again cannot stand in for a second one, which
+            // is what WAIT 2 asks for: the count has to stay the number of replicas
+            downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+            downstream.send(frame("REPLCONF", "ACK", "" + write.length));
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "2", "150"));
+                downstream.readControlFrame();
+                assertEquals(":1", client.readReply(),
+                        "one replica acknowledged twice and was counted as two");
+            }
+        }
+    }
+
+    @Test
+    void anAcknowledgementNamingAnEarlierOffsetDoesNotSatisfyALaterWait() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            byte[] first = frame("SET", "chain:wait:stale", "one");
+            feed(first);
+
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "5000"));
+                downstream.readControlFrame();
+                downstream.send(frame("REPLCONF", "ACK", "" + first.length));
+                assertEquals(":1", client.readReply(), "the replica that acknowledged was not counted");
+            }
+
+            // the stream moves on, so the acknowledgement the replica already sent names a
+            // position it has been passed by
+            byte[] second = frame("SET", "chain:wait:stale", "two");
+            feed(second);
+            assertEquals(first.length + second.length, redisConfig.getMasterReplOffset().longValue(),
+                    "the write after the first acknowledgement did not move the offset");
+
+            downstream.send(frame("REPLCONF", "ACK", "" + first.length));
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("WAIT", "1", "150"));
+                downstream.readControlFrame();
+                assertEquals(":0", client.readReply(),
+                        "an acknowledgement for an offset the stream had already passed satisfied a later WAIT");
+            }
+        }
+    }
+
+    @Test
+    void incrementsReceivedFromTheMasterAreAppliedAndPropagated() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+
+            feed(frame("INCR", "chain:counter"), frame("INCR", "chain:counter"), frame("INCR", "chain:counter"));
+
+            assertEquals("3", store.getValue("chain:counter").val,
+                    "the streamed increments were not all applied");
+            // the downstream replica is sent the increments themselves, not the values it
+            // would compute, so it stays in step with this replica
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(3, received.size());
+            for (int i = 0; i < 3; i++) {
+                assertArrayEquals(new String[]{"INCR", "chain:counter"}, received.get(i));
+            }
+        }
+    }
+
+    @Test
+    void replicaKeepsServingItsOwnClientsWhileItReplicates() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            feed(frame("SET", "chain:client", "served"));
+
+            try (RespSocket client = new RespSocket(replicaPort)) {
+                client.send(frame("PING"));
+                assertEquals("+PONG", client.readReply());
+                client.send(frame("GET", "chain:client"));
+                assertEquals("$6\r\nserved\r\n", client.readReply());
+                client.send(frame("SET", "chain:client", "nope"));
+                String write = client.readReply();
+                assertTrue(write.startsWith("-READONLY"), "the replica accepted a write, answering: " + write);
+                client.send(frame("GET", "chain:never-written"));
+                assertEquals("$-1", client.readReply());
+            }
+        }
+    }
+
+    @Test
+    void aDeleteFromTheMasterIsAppliedAndPassedOnExactlyOnce() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:delete");
+
+            feed(frame("SET", "chain:delete", "value"), frame("DEL", "chain:delete"));
+
+            assertNull(store.getValue("chain:delete"),
+                    "the replica still holds a key its master deleted");
+            // the delete has to travel on as well, or a replica of this one keeps the key
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(2, received.size(), "the delete was not passed on once: " + received);
+            assertArrayEquals(new String[]{"SET", "chain:delete", "value"}, received.get(0));
+            assertArrayEquals(new String[]{"DEL", "chain:delete"}, received.get(1));
+        }
+    }
+
+    @Test
+    void theDeletesOfATransactionAreAppliedInOrderAndPassedOn() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            for (String key : List.of("chain:tx-a", "chain:tx-b")) {
+                store.map.remove(key);
+            }
+
+            // what a master sends after EXEC of MULTI / SET a 1 / SET b 2 / DEL a: the
+            // queued mutations as they were applied, not a MULTI block
+            feed(frame("SET", "chain:tx-a", "1"), frame("SET", "chain:tx-b", "2"),
+                    frame("DEL", "chain:tx-a"));
+
+            assertNull(store.getValue("chain:tx-a"),
+                    "the transaction's delete was not applied, so the replica is out of step");
+            assertEquals("2", store.getValue("chain:tx-b").val,
+                    "the transaction's surviving set was not applied");
+
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(3, received.size(), "the transaction was not passed on whole: " + received);
+            assertArrayEquals(new String[]{"SET", "chain:tx-a", "1"}, received.get(0));
+            assertArrayEquals(new String[]{"SET", "chain:tx-b", "2"}, received.get(1));
+            assertArrayEquals(new String[]{"DEL", "chain:tx-a"}, received.get(2));
+        }
+    }
+
+    @Test
+    void aDeleteOfAKeyThisReplicaNeverHadLeavesItInStepAndKeepsTheStreamAlive() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:never-existed");
+
+            // the delete is idempotent: a master that refused it for a missing key leaves
+            // this replica in exactly the state it is already in
+            feed(frame("DEL", "chain:never-existed"));
+
+            assertNull(store.getValue("chain:never-existed"));
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(1, received.size(), "the delete was not passed on: " + received);
+            assertArrayEquals(new String[]{"DEL", "chain:never-existed"}, received.get(0));
+
+            // and the stream is unharmed: the next write is still applied and passed on
+            feed(frame("SET", "chain:after-missing-delete", "fine"));
+            assertEquals("fine", store.getValue("chain:after-missing-delete").val,
+                    "a delete of a missing key disturbed the writes that followed it");
+            List<String[]> after = downstream.readFramesUntilAck();
+            assertEquals(1, after.size());
+            assertArrayEquals(new String[]{"SET", "chain:after-missing-delete", "fine"}, after.get(0));
+        }
+    }
+
+@Test
+    void aDeleteIsCountedInTheBytesThatWereSentAndInTheOffset() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("chain:counted-delete");
+
+            feed(frame("SET", "chain:counted-delete", "value"), frame("DEL", "chain:counted-delete"));
+
+            assertNull(store.getValue("chain:counted-delete"), "the delete was not applied");
+            // both hops count the frame it actually sent, so a downstream replica's ACK
+            // matches this hop's number and WAIT counts the delete like any other write
+            long expected = frame("SET", "chain:counted-delete", "value").length
+                    + frame("DEL", "chain:counted-delete").length;
+            // one number: it is both where this hop's stream stands and how many bytes the
+            // next hop has been sent
+            assertEquals(expected, redisConfig.getMasterReplOffset().longValue(),
+                    "the bytes sent onwards do not match the frames that were propagated");
+            assertEquals(2, downstream.readFramesUntilAck().size());
+        }
+    }
+
+    @Test
+    void aReplicaKeepsNoFileOfItsOwnForAReplicatedDelete() throws Exception {
+        store.map.remove("chain:no-local-file");
+        // configured to append anyway: a replica holds no dataset of its own, so it must
+        // neither start a file nor write the writes it applies from upstream
+        assertEquals(0, appendOnlyPersistence.start(),
+                "a replica reported writing commands from a file");
+        assertFalse(appendOnlyPersistence.isEnabled(), "a replica opened an append-only file");
+
+        feed(frame("SET", "chain:no-local-file", "value"), frame("DEL", "chain:no-local-file"));
+
+        assertNull(store.getValue("chain:no-local-file"));
+        assertFalse(appendOnlyPersistence.isEnabled(),
+                "applying an upstream write re-opened the append-only file");
+        assertFalse(Files.exists(replicaAppendOnlyFile),
+                "a replica wrote a file of its own: " + replicaAppendOnlyFile);
+    }
+
+
+
+    /**
+     * A write larger than a socket can hold is queued for a replica that is not reading,
+     * and the thread applying it neither blocks nor holds the backlog lock while the frame
+     * is on its way out. This is the trailer of the old hang: propagation wrote the frame to
+     * the socket from inside the backlog's lock, so one replica that stopped reading took the
+     * whole stream down with it.
+     */
+    @Test
+    void aLargeValueIsQueuedWithoutHoldingTheBacklogLock() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            // the downstream deliberately never reads: a write that went to the socket inside
+            // the lock would stay blocked there, holding every other writer out
+            byte[] big = frame("SET", "chain:big", "v".repeat(4 * 1024 * 1024));
+
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread feeder = new Thread(() -> {
+                try {
+                    feed(big);
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            }, "large-write-feeder");
+            feeder.setDaemon(true);
+            feeder.start();
+
+            // a second thread must be able to take the backlog lock while the large write is
+            // being applied: the frame is only queued under it, never written to a socket
+            assertTrue(canTakeBacklogLockWithin(5_000),
+                    "a large write held the backlog lock while writing to a replica socket");
+
+            feeder.join(AWAIT_TIMEOUT_MS);
+            assertFalse(feeder.isAlive(),
+                    "applying a large write to a replica that is not reading never finished");
+            assertNull(failure.get(), "the large write failed: " + failure.get());
+            assertEquals(4 * 1024 * 1024, store.getValue("chain:big").val.length(),
+                    "the large write was not applied");
+            // leave the keyspace small for the tests that follow: a later full resync would
+            // otherwise carry this value with it
+            store.map.remove("chain:big");
+        }
+        await(() -> connectionPool.getSlaves().isEmpty(), "the replica that stopped reading was never cleaned up");
+    }
+
+    /**
+     * A replica that stops reading is let go of once more is waiting for it than its outbound
+     * buffer holds, rather than the master buffering the whole stream on its behalf. Nothing
+     * is silently dropped: the replica is disconnected and recovers through the ordinary
+     * PSYNC / full resync path.
+     */
+    @Test
+    void aReplicaThatStopsReadingIsDroppedOnceItsOutboundBufferOverflows() throws Exception {
+        // a small receive window so the master's socket fills quickly and the queue is what
+        // is left to grow past its bound
+        try (RespSocket stalled = new RespSocket(replicaPort, 8 * 1024)) {
+            register(stalled);
+
+            // never read. More than the outbound buffer holds, well past it, and the frames
+            // keep arriving: the queue has to overflow and the replica has to go
+            ByteArrayOutputStream upstream = new ByteArrayOutputStream();
+            for (int i = 0; i < 4_000; i++) {
+                upstream.writeBytes(frame("SET", "chain:flood", "v".repeat(1024)));
+            }
+            feed(upstream.toByteArray());
+
+            await(() -> connectionPool.getSlaves().isEmpty(),
+                    "a replica that stopped reading was never dropped");
+            store.map.remove("chain:flood");
+        }
+    }
+
+    /** Every registered replica is sent every write, in the order they were applied. */
+    @Test
+    void aWriteIsPropagatedToEveryReplicaInOrder() throws Exception {
+        try (RespSocket first = new RespSocket(replicaPort);
+             RespSocket second = new RespSocket(replicaPort)) {
+            register(first, replicaPort);
+            register(second, replicaPort + 1);
+            await(() -> connectionPool.getSlaves().size() == 2, "both replicas were not registered");
+
+            List<String> values = new ArrayList<>();
+            ByteArrayOutputStream upstream = new ByteArrayOutputStream();
+            for (int i = 0; i < 40; i++) {
+                values.add("value-" + i);
+                upstream.writeBytes(frame("SET", "chain:fanout", "value-" + i));
+            }
+            feed(upstream.toByteArray());
+
+            assertFramesInOrder(first, "chain:fanout", values);
+            assertFramesInOrder(second, "chain:fanout", values);
+            store.map.remove("chain:fanout");
+        }
+    }
+
+    /**
+     * A replica that stops reading cannot hold a write back from a replica that is reading.
+     * On the old code the write to the stalled replica blocked while the backlog lock was
+     * held, so the healthy replica waited behind it and the applying thread never returned.
+     *
+     * <p>The writes are enough to fill every socket buffer but stay under the outbound
+     * budget, so the stalled replica is the only one that can hold the stream up: the healthy
+     * one is served from its queue whether or not it has started reading.</p>
+     */
+    @Test
+    void aStalledReplicaDoesNotDelayAHealthyOne() throws Exception {
+        try (RespSocket healthy = new RespSocket(replicaPort);
+             RespSocket stalled = new RespSocket(replicaPort, 8 * 1024)) {
+            register(healthy, replicaPort);
+            register(stalled, replicaPort + 1);
+            await(() -> connectionPool.getSlaves().size() == 2, "both replicas were not registered");
+
+            // the stalled replica never reads. The writes fill its small window many times
+            // over, so a direct write would block on it, yet the whole batch is under the
+            // outbound buffer, so the healthy replica is never the one dropped
+            List<String> values = new ArrayList<>();
+            ByteArrayOutputStream upstream = new ByteArrayOutputStream();
+            for (int i = 0; i < 2_000; i++) {
+                String value = "v".repeat(500) + "-" + i;
+                values.add(value);
+                upstream.writeBytes(frame("SET", "chain:healthy", value));
+            }
+            byte[] all = upstream.toByteArray();
+            assertTrue(all.length < 2L * 1024 * 1024,
+                    "the test writes more than the outbound buffer holds: " + all.length);
+
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread feeder = new Thread(() -> {
+                try {
+                    feed(all);
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            }, "healthy-fanout-feeder");
+            feeder.setDaemon(true);
+            feeder.start();
+            feeder.join(AWAIT_TIMEOUT_MS);
+            assertFalse(feeder.isAlive(), "a stalled replica held the applying thread up");
+            assertNull(failure.get(), "the write failed: " + failure.get());
+
+            assertFramesInOrder(healthy, "chain:healthy", values);
+            store.map.remove("chain:healthy");
+        }
+    }
+
+    /** A replica that disconnects leaves no sender thread writing for a socket that is gone. */
+    @Test
+    void aDisconnectedReplicaLeavesNoSenderThreadBehind() throws Exception {
+        RespSocket downstream = new RespSocket(replicaPort);
+        register(downstream);
+        await(() -> outboundSenderThreads() >= 1, "the replica's sender thread was never started");
+
+        downstream.close();
+
+        await(() -> connectionPool.getSlaves().isEmpty(), "the disconnected replica stayed registered");
+        await(() -> outboundSenderThreads() == 0, "a sender thread outlived its replica");
+    }
+
+    /**
+     * Registers a downstream replica and starts its command stream, which is what a real
+     * replica does before it can be sent anything: the master holds writes back until the
+     * PSYNC has been answered, so a replica that stopped at the listening port would
+     * receive nothing.
+     */
+    private void register(RespSocket downstream) throws Exception {
+        register(downstream, replicaPort);
+        await(() -> !connectionPool.getSlaves().isEmpty(), "the downstream replica never registered");
+    }
+
+    private void register(RespSocket downstream, int listeningPort) throws Exception {
+        registerOnly(downstream, listeningPort);
+        downstream.send(frame("REPLCONF", "capa", "psync2"));
+        assertEquals("+OK", downstream.readReply());
+        downstream.send(frame("PSYNC", "?", "-1"));
+        String status = downstream.readLine();
+        assertTrue(status.startsWith("+FULLRESYNC "), "no FULLRESYNC for the downstream replica: " + status);
+        // the snapshot is counted off, so nothing that follows it is read as part of the payload
+        int declaredLength = Integer.parseInt(downstream.readLine().substring(1));
+        downstream.readExactly(declaredLength);
+    }
+
+    /** Stops after the listening port, which is where the connection is registered. */
+    private void registerOnly(RespSocket downstream) throws Exception {
+        registerOnly(downstream, replicaPort);
+    }
+
+    private void registerOnly(RespSocket downstream, int listeningPort) throws Exception {
+        downstream.send(frame("REPLCONF", "listening-port", "" + listeningPort));
+        assertEquals("+OK", downstream.readReply());
+        await(() -> connectionPool.slaveAtPort(listeningPort, null) != null,
+                "the downstream replica never registered on port " + listeningPort);
+    }
+
+    /** Reads until the replica's answer to a GETACK, checking the writes came in order. */
+    private void assertFramesInOrder(RespSocket downstream, String key, List<String> values) throws IOException {
+        List<String[]> received = downstream.readFramesUntilAck();
+        assertEquals(values.size(), received.size(), "the replica did not get every write: " + received);
+        for (int i = 0; i < values.size(); i++) {
+            assertArrayEquals(new String[]{"SET", key, values.get(i)}, received.get(i),
+                    "write " + i + " did not arrive in the order it was applied");
+        }
+    }
+
+    /**
+     * Whether a fresh thread can take the backlog lock within the timeout. It is used to show
+     * that the thread applying a write does not hold that lock across a socket write.
+     */
+    private boolean canTakeBacklogLockWithin(long timeoutMs) throws InterruptedException {
+        CountDownLatch taken = new CountDownLatch(1);
+        Thread prober = new Thread(() -> {
+            synchronized (redisConfig.getReplicationBacklog()) {
+                taken.countDown();
+            }
+        }, "backlog-lock-prober");
+        prober.setDaemon(true);
+        prober.start();
+        try {
+            return taken.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } finally {
+            prober.join(1_000);
+        }
+    }
+
+    private long outboundSenderThreads() {
+        long count = 0;
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (thread.isAlive() && thread.getName().startsWith("replica-outbound-")) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** Runs the upstream stream the way the master's socket delivers it. */
+    private void feed(byte[]... reads) throws IOException {
+        Client master = new Client(new Socket(), new ChunkedInputStream(List.of(reads)),
+                new ByteArrayOutputStream(), -1);
+        slaveTcpServer.streamFromMaster(master);
+    }
+
+    private Slave awaitSlave() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (!connectionPool.getSlaves().isEmpty()) {
+                return connectionPool.getSlaves().iterator().next();
+            }
+            Thread.sleep(25);
+        }
+        fail("no replica registered");
+        return null;
+    }
+
+    private static byte[] frame(String... parts) {
+        StringBuilder sb = new StringBuilder("*").append(parts.length).append("\r\n");
+        for (String part : parts) {
+            // RESP counts bytes, not characters, so a key that is not ASCII has to declare
+            // the length it will actually travel as
+            byte[] payload = part.getBytes(StandardCharsets.UTF_8);
+            sb.append("$").append(payload.length).append("\r\n").append(part).append("\r\n");
+        }
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static int freePort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
+
+
+
+    private static void awaitPortOpen(int port) throws Exception {
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        Exception lastFailure = null;
+        while (System.currentTimeMillis() < deadline) {
+            try (Socket ignored = new Socket("127.0.0.1", port)) {
+                return;
+            } catch (IOException e) {
+                lastFailure = e;
+                Thread.sleep(25);
+            }
+        }
+        throw new IllegalStateException("nothing started listening on port " + port, lastFailure);
+    }
+
+    private static void await(BooleanSupplier condition, String failureMessage) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        fail(failureMessage);
+    }
+
+    /** Hands out one scripted chunk per read, which is what a socket does. */
+    private static final class ChunkedInputStream extends InputStream {
+        private final List<byte[]> chunks;
+        private int next;
+        private int position;
+
+        ChunkedInputStream(List<byte[]> chunks) {
+            this.chunks = chunks;
+        }
+
+        private byte[] current() throws IOException {
+            while (next < chunks.size()) {
+                byte[] chunk = chunks.get(next);
+                if (position < chunk.length) {
+                    return chunk;
+                }
+                next++;
+                position = 0;
+            }
+            return null;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] chunk = current();
+            return chunk == null ? -1 : chunk[position++] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] destination, int offset, int length) throws IOException {
+            byte[] chunk = current();
+            if (chunk == null) {
+                return -1;
+            }
+            // a read stops at the end of what is available, so a chunk bigger than the
+            // buffer is handed over in pieces instead of losing its tail
+            int count = Math.min(length, chunk.length - position);
+            System.arraycopy(chunk, position, destination, offset, count);
+            position += count;
+            return count;
+        }
+    }
+
+    /** A raw RESP client, so a test can read exactly the bytes a replica was sent. */
+    private final class RespSocket implements AutoCloseable {
+        private final Socket socket;
+        private final InputStream in;
+        private final OutputStream out;
+        private byte[] buffered = new byte[0];
+        private int filled;
+        /**
+         * Frames that were whole in the buffer but not yet handed out. A single read can
+         * carry more than one whole frame - a propagated write and the GETACK that follows
+         * it, for instance - so a reader that only returned the first would silently drop
+         * the rest and then block for a frame that had already arrived.
+         */
+        private final Deque<String[]> pendingFrames = new ArrayDeque<>();
+
+        RespSocket(int port) throws IOException {
+            this(port, -1);
+        }
+
+        /**
+         * Opens a connection with a chosen receive window, which is set before connecting so
+         * it is in effect from the handshake. A small one makes the master's socket fill
+         * quickly, which is what lets a stalled replica's outbound buffer be the thing that
+         * grows.
+         */
+        RespSocket(int port, int receiveBufferBytes) throws IOException {
+            socket = new Socket();
+            if (receiveBufferBytes > 0) {
+                socket.setReceiveBufferSize(receiveBufferBytes);
+            }
+            socket.connect(new InetSocketAddress("127.0.0.1", port));
+            socket.setSoTimeout((int) AWAIT_TIMEOUT_MS);
+            socket.setTcpNoDelay(true);
+            in = socket.getInputStream();
+            out = socket.getOutputStream();
+        }
+
+        void send(byte[] bytes) throws IOException {
+            out.write(bytes);
+            out.flush();
+        }
+
+        String readLine() throws IOException {
+            StringBuilder sb = new StringBuilder();
+            int b;
+            while ((b = in.read()) != -1) {
+                if (b == '\r') {
+                    if (in.read() != '\n') {
+                        throw new IOException("expected LF after CR");
+                    }
+                    return sb.toString();
+                }
+                sb.append((char) b);
+            }
+            throw new EOFException("connection closed mid line");
+        }
+
+        /** Reads one reply, CRLF included, so a bulk string keeps its "$3\r\n" header. */
+        String readReply() throws IOException {
+            String header = readLine();
+            if (!header.startsWith("$")) {
+                return header;
+            }
+            int length = Integer.parseInt(header.substring(1));
+            if (length < 0) {
+                return header;
+            }
+            byte[] payload = readExactly(length);
+            readExactly(2);
+            return header + "\r\n" + new String(payload, StandardCharsets.UTF_8) + "\r\n";
+        }
+
+        byte[] readExactly(int length) throws IOException {
+            byte[] payload = in.readNBytes(length);
+            if (payload.length != length) {
+                throw new EOFException("held " + payload.length + " of " + length + " bytes");
+            }
+            return payload;
+        }
+
+        /** Reads the next whole frame the replica sent, in the order it was sent. */
+        String[] readFrame() throws IOException {
+            return nextFrame();
+        }
+
+        /** Reads the next replication control frame, stepping over propagated writes. */
+        String[] readControlFrame() throws IOException {
+            while (true) {
+                String[] command = readFrame();
+                if (command[0].equalsIgnoreCase("REPLCONF")) {
+                    return command;
+                }
+            }
+        }
+
+        /**
+         * Reads the frames the replica propagated, using a GETACK as a barrier: propagation
+         * happens on the upstream thread, so once the upstream stream has finished, the
+         * answer to the barrier sits behind every byte that was propagated.
+         */
+        List<String[]> readFramesUntilAck() throws IOException {
+            List<String[]> frames = new ArrayList<>();
+            send(frame("REPLCONF", "GETACK", "*"));
+            while (true) {
+                String[] command = nextFrame();
+                if (command[0].equalsIgnoreCase("REPLCONF") && command[1].equalsIgnoreCase("ACK")) {
+                    return frames;
+                }
+                frames.add(command);
+            }
+        }
+
+        /**
+         * The next whole frame, whether it was already buffered or has to be read. Every
+         * whole frame a read uncovers is kept, so nothing between two frames is ever lost.
+         */
+        private String[] nextFrame() throws IOException {
+            while (pendingFrames.isEmpty()) {
+                List<String[]> frames = takeWholeFrames();
+                if (!frames.isEmpty()) {
+                    pendingFrames.addAll(frames);
+                    break;
+                }
+                fill();
+            }
+            return pendingFrames.pollFirst();
+        }
+
+        /** Returns "" when the replica sends nothing at all, which some replies are. */
+        String expectNothing() throws IOException {
+            socket.setSoTimeout((int) NOTHING_EXPECTED_MS);
+            try {
+                return readReply();
+            } catch (SocketTimeoutException e) {
+                return "";
+            } finally {
+                socket.setSoTimeout((int) AWAIT_TIMEOUT_MS);
+            }
+        }
+
+        private List<String[]> takeWholeFrames() {
+            List<String[]> frames = new ArrayList<>();
+            int consumed = 0;
+            while (true) {
+                int frameLength = respSerializer.frameLength(buffered, consumed, filled);
+                if (frameLength < 0) {
+                    break;
+                }
+                frames.addAll(respSerializer.deseralize(buffered, consumed, consumed + frameLength));
+                consumed += frameLength;
+            }
+            if (consumed > 0) {
+                buffered = Arrays.copyOfRange(buffered, consumed, filled);
+                filled -= consumed;
+            }
+            return frames;
+        }
+
+        private void fill() throws IOException {
+            byte[] chunk = new byte[4096];
+            int bytesRead = in.read(chunk);
+            if (bytesRead == -1) {
+                throw new EOFException("the replica hung up");
+            }
+            buffered = Arrays.copyOf(buffered, filled + bytesRead);
+            System.arraycopy(chunk, 0, buffered, filled, bytesRead);
+            filled += bytesRead;
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+}

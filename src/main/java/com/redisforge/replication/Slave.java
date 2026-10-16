@@ -1,4 +1,5 @@
 package com.redisforge.replication;
+import com.redisforge.network.Client;
 
 import java.io.IOException;
 import java.util.ArrayDeque;

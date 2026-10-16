@@ -1,4 +1,6 @@
 package com.redisforge.server;
+import com.redisforge.network.Client;
+import com.redisforge.replication.Slave;
 
 import org.springframework.stereotype.Component;
 

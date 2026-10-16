@@ -5,6 +5,13 @@ on:
     branches: [ main ]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: redisforge-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,6 +31,20 @@ jobs:
 
       - name: Package the jar
         run: mvn -B package -DskipTests
+
+      - name: Build the container image
+        run: docker build --tag redisforge:ci .
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Lint the Helm chart
+        run: helm lint helm/redisforge
+
+      - name: Render Kubernetes manifests
+        run: helm template redisforge helm/redisforge --namespace redisforge
 
       - name: Upload test reports
         if: always()

@@ -4,6 +4,35 @@ A Redis-compatible in-memory server written in Java 23, speaking the RESP protoc
 over TCP. RedisForge implements the core Redis command set along with transactions
 and asynchronous master/replica replication.
 
+## Source layout
+
+The code is grouped by responsibility under the standard Maven source tree:
+
+```text
+src/
+  main/java/com/redisforge/
+    Main.java
+    command/       Command dispatch and command semantics
+    config/        Spring wiring
+    network/       Client connection primitives
+    persistence/   Append-only file, replay and fsync policy
+    protocol/      RESP framing, parsing and replies
+    replication/   Replica links and replication backlog
+    server/        Master/replica listeners and runtime options
+    store/         Key/value state, typed values, expiry and memory policy
+  test/java/com/redisforge/
+    benchmark/     Standalone benchmark harness
+    persistence/   AOF recovery tests
+    protocol/      RESP tests
+    replication/   Replication backlog tests
+    server/        Socket, command, concurrency and replication tests
+    store/         Store, typed-value and memory tests
+```
+
+The package names and directory names match, so classes can be found by their domain
+rather than through a generic `Components` bucket. Tests follow the same package boundaries
+as the code they exercise.
+
 ## Features
 
 - RESP protocol over a plain TCP socket
@@ -200,7 +229,7 @@ hash, list or set, and the typed reads do the same against a string.
 
 ## Benchmark
 
-[`src/test/java/Components/Benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
+[`src/test/java/com/redisforge/benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
 is a plain-JDK harness in the test tree that hammers a RedisForge server that is already
 up. It is deliberately not a JUnit test, so `mvn test` does not run it. Point it at a
 running server:
@@ -265,16 +294,38 @@ docker run -p 6480:6480 redisforge --port 6480 --replicaof "<master-ip> 6379"
 
 ## Kubernetes
 
-A Helm chart is included under [`helm/redisforge`](helm/redisforge):
+The Helm chart under [`helm/redisforge`](helm/redisforge) uses a single StatefulSet,
+a headless service for the pod identity, and a client service. The client service is
+`ClusterIP` by default, so the unauthenticated TCP server is not exposed outside the
+cluster unless you explicitly change the service type.
+
+Build and publish the image first, then set the repository and tag you published:
 
 ```sh
 helm lint helm/redisforge
-helm template helm/redisforge
-helm install redisforge helm/redisforge
+helm template redisforge helm/redisforge --namespace redisforge
+helm install redisforge helm/redisforge \
+  --namespace redisforge --create-namespace \
+  --set image.repository=YOUR_REGISTRY/redisforge \
+  --set image.tag=YOUR_TAG
 ```
 
-Set `image.repository` and `image.tag` in `helm/redisforge/values.yaml` to match the
-image you published.
+Persistence is off by default. That keeps local chart installs simple, but data is
+ephemeral across pod replacement. For AOF-backed storage, enable the chart's PVC and
+AOF settings together:
+
+```sh
+helm upgrade --install redisforge helm/redisforge \
+  --namespace redisforge --create-namespace \
+  --set image.repository=YOUR_REGISTRY/redisforge \
+  --set image.tag=YOUR_TAG \
+  --set persistence.enabled=true
+```
+
+The chart is intentionally a single-instance starting point, not a horizontally
+scalable Redis cluster. RedisForge speaks plain TCP and does not provide AUTH or TLS;
+keep it on a trusted network and do not expose the service publicly.
+
 
 ## Supported commands
 

@@ -1,6 +1,7 @@
 package com.redisforge.network;
 
 import com.redisforge.protocol.ResponseDto;
+import com.redisforge.replication.Slave;
 
 import java.io.IOException;
 import java.io.InputStream;

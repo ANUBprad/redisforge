@@ -11,17 +11,16 @@ RUN mvn -B package -DskipTests
 FROM eclipse-temurin:23-jre-alpine
 WORKDIR /app
 
-# the server runs as its own user rather than root, so a process that is
-# compromised does not get the container's root. The append-only file is written
-# under /data when persistence is wanted; /app stays writable too, for a server
-# run with the default --appendfilename.
-RUN addgroup -S redisforge && adduser -S -G redisforge redisforge \
+# Keep the runtime identity stable so Kubernetes can grant write access to /data
+# without running the server as root.
+RUN addgroup -S -g 10001 redisforge \
+    && adduser -S -D -H -u 10001 -G redisforge redisforge \
     && mkdir -p /data \
     && chown -R redisforge:redisforge /app /data
 
-COPY --from=build /app/target/redisforge.jar .
+COPY --from=build --chown=redisforge:redisforge /app/target/redisforge.jar ./redisforge.jar
 
-USER redisforge
+USER 10001:10001
 
 EXPOSE 6379
 

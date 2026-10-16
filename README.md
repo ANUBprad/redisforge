@@ -294,16 +294,38 @@ docker run -p 6480:6480 redisforge --port 6480 --replicaof "<master-ip> 6379"
 
 ## Kubernetes
 
-A Helm chart is included under [`helm/redisforge`](helm/redisforge):
+The Helm chart under [`helm/redisforge`](helm/redisforge) uses a single StatefulSet,
+a headless service for the pod identity, and a client service. The client service is
+`ClusterIP` by default, so the unauthenticated TCP server is not exposed outside the
+cluster unless you explicitly change the service type.
+
+Build and publish the image first, then set the repository and tag you published:
 
 ```sh
 helm lint helm/redisforge
-helm template helm/redisforge
-helm install redisforge helm/redisforge
+helm template redisforge helm/redisforge --namespace redisforge
+helm install redisforge helm/redisforge \
+  --namespace redisforge --create-namespace \
+  --set image.repository=YOUR_REGISTRY/redisforge \
+  --set image.tag=YOUR_TAG
 ```
 
-Set `image.repository` and `image.tag` in `helm/redisforge/values.yaml` to match the
-image you published.
+Persistence is off by default. That keeps local chart installs simple, but data is
+ephemeral across pod replacement. For AOF-backed storage, enable the chart's PVC and
+AOF settings together:
+
+```sh
+helm upgrade --install redisforge helm/redisforge \
+  --namespace redisforge --create-namespace \
+  --set image.repository=YOUR_REGISTRY/redisforge \
+  --set image.tag=YOUR_TAG \
+  --set persistence.enabled=true
+```
+
+The chart is intentionally a single-instance starting point, not a horizontally
+scalable Redis cluster. RedisForge speaks plain TCP and does not provide AUTH or TLS;
+keep it on a trusted network and do not expose the service publicly.
+
 
 ## Supported commands
 

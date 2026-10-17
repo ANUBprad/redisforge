@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -193,6 +194,85 @@ class DelServerTest {
                 "a multi-key delete dropped the keys after the first");
     }
 
+    @Test
+    void aTransactionalDelCountsOnlyTheKeysItActuallyRemoved() throws Exception {
+        store.set("del:tx:a", "1");
+        store.set("del:tx:b", "2");
+
+        int before = frames().size();
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("MULTI"));
+            assertEquals("OK", client.readReply());
+            client.send(frame("DEL", "del:tx:a", "del:tx:absent", "del:tx:b"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("EXEC"));
+            assertEquals(List.of(2L), client.readReply(),
+                    "a transactional delete did not answer with the number of keys it removed");
+        }
+        assertNull(store.peekValue("del:tx:a"), "the first key a transactional delete named survived");
+        assertNull(store.peekValue("del:tx:b"), "a key a transactional delete named survived");
+
+        List<String[]> written = framesSince(before);
+        assertEquals(3, written.size(),
+                "the transactional delete was not written as one block: " + describe(written));
+        assertArrayEquals(new String[]{"MULTI"}, written.get(0));
+        assertArrayEquals(new String[]{"DEL", "del:tx:a", "del:tx:absent", "del:tx:b"}, written.get(1));
+        assertArrayEquals(new String[]{"EXEC"}, written.get(2));
+
+        Store replayed = replayIntoNewStore();
+        assertNull(replayed.peekValue("del:tx:a"), "a key a transactional delete removed came back after a restart");
+        assertNull(replayed.peekValue("del:tx:b"), "a key a transactional delete removed came back after a restart");
+    }
+
+    @Test
+    void aTransactionalDelOfAKeyThatWasNotThereChangesNothing() throws Exception {
+        store.map.remove("del:tx:missing");
+
+        int before = frames().size();
+        long streamMark = redisConfig.getMasterReplOffset();
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("MULTI"));
+            assertEquals("OK", client.readReply());
+            client.send(frame("DEL", "del:tx:missing"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("EXEC"));
+            assertEquals(List.of(0L), client.readReply(),
+                    "a transactional delete of a missing key was not answered with a count of zero");
+        }
+        assertTrue(framesSince(before).isEmpty(),
+                "a transactional delete that removed nothing was recorded: " + describe(framesSince(before)));
+        assertTrue(propagatedSince(streamMark).isEmpty(),
+                "a transactional delete that removed nothing was passed to replicas: "
+                        + describe(propagatedSince(streamMark)));
+    }
+
+    @Test
+    void aTransactionPassesOnOnlyTheCommandsItApplied() throws Exception {
+        store.map.remove("del:tx:prop");
+
+        long streamMark = redisConfig.getMasterReplOffset();
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("MULTI"));
+            assertEquals("OK", client.readReply());
+            client.send(frame("SET", "del:tx:prop", "written"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("GET", "del:tx:prop"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("DEL", "del:tx:absent"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("INCR", "del:tx:prop"));
+            assertEquals("QUEUED", client.readReply());
+            client.send(frame("EXEC"));
+            assertEquals(4, ((List<?>) client.readReply()).size(),
+                    "the transaction did not answer with one reply per queued command");
+        }
+
+        List<String[]> propagated = propagatedSince(streamMark);
+        assertEquals(1, propagated.size(),
+                "a read, a refused or a no-op command was passed to replicas: " + describe(propagated));
+        assertArrayEquals(new String[]{"SET", "del:tx:prop", "written"}, propagated.get(0));
+    }
+
     // ----------------------------------------------------------------- harness
 
     /** Runs the upstream stream the way the master's socket delivers it. */
@@ -218,6 +298,31 @@ class DelServerTest {
     private List<String[]> framesSince(int mark) {
         List<String[]> all = frames();
         return all.subList(mark, all.size());
+    }
+
+    /** The frames the master passed to replicas since the stream stood at this offset. */
+    private List<String[]> propagatedSince(long fromOffset) {
+        byte[] bytes = redisConfig.getReplicationBacklog().read(fromOffset);
+        List<String[]> frames = new ArrayList<>();
+        int offset = 0;
+        while (offset < bytes.length) {
+            int length = respSerializer.frameLength(bytes, offset, bytes.length);
+            assertTrue(length > 0, "the replication stream has a partial frame at " + offset);
+            frames.addAll(respSerializer.deseralize(bytes, offset, offset + length));
+            offset += length;
+        }
+        return frames;
+    }
+
+    private static String describe(List<String[]> frames) {
+        StringBuilder sb = new StringBuilder("[");
+        for (String[] frame : frames) {
+            if (sb.length() > 1) {
+                sb.append(", ");
+            }
+            sb.append(String.join(" ", frame));
+        }
+        return sb.append("]").toString();
     }
 
     private List<String[]> frames() {

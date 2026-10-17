@@ -395,8 +395,13 @@ public class AppendOnlyPersistence {
         }
     }
 
-    /** Only these change the keyspace, so only these are ever written down. */
-    private static boolean isMutation(String[] command) {
+    /**
+     * Whether a command changes the keyspace, so it is one a transaction must write down and
+     * pass on. A read changes nothing and a control frame is not a command; both are left
+     * out. Public because the transaction path filters by exactly this when it decides what
+     * to propagate: the file and the replica stream must carry the same frames.
+     */
+    public static boolean isMutation(String[] command) {
         if (command.length < 2) {
             return false;
         }

@@ -8,11 +8,13 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 
 public class Client {
     public Socket socket;
@@ -30,6 +32,15 @@ public class Client {
      * exact command array so the order of the queue is preserved.
      */
     public Map<String[], String[]> transactionPropagation = new IdentityHashMap<>();
+    /**
+     * The queued commands that were applied but changed nothing, so they must not be
+     * written to the append-only file or passed to replicas. A refused command is already
+     * recognisable from its error reply; a no-op command - a {@code DEL} of a key that was
+     * not there, an expiration on a missing key, a typed write that left its value as it
+     * was - answers a normal reply and is recorded here instead, keyed by the exact command
+     * array so the order of the queue is preserved.
+     */
+    public Set<String[]> transactionNoOps = Collections.newSetFromMap(new IdentityHashMap<>());
 
     /**
      * The replica this connection registered as, if it did. Set once when the connection
@@ -53,12 +64,14 @@ public class Client {
         transactionResponse = new ArrayList<>();
         commandQueue = new LinkedList<>();
         transactionPropagation = new IdentityHashMap<>();
+        transactionNoOps = Collections.newSetFromMap(new IdentityHashMap<>());
         return transactionalContext;
     }
 
     public void endTransaction(){
         commandQueue = null;
         transactionPropagation = new IdentityHashMap<>();
+        transactionNoOps = Collections.newSetFromMap(new IdentityHashMap<>());
         transactionalContext=false;
     }
 

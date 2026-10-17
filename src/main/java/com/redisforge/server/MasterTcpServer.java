@@ -195,6 +195,12 @@ public class MasterTcpServer {
                 // counted into the stream, and the file lock is taken inside it, in the
                 // order a single command takes them
                 String transactionError;
+                // the frames the transaction really applied, in order: what the file records
+                // and what every replica is sent. A read, a refused command and a no-op
+                // command are not in here, and a typed command that recorded its own frame -
+                // an SPOP written down as the SREM of the members it popped - is replaced by
+                // that frame while this list is built, so the file and the stream carry it.
+                List<String[]> appliedTransaction = new ArrayList<>();
                 synchronized (redisConfig.getReplicationBacklog()) {
                     String[] errorHolder = new String[1];
                     // the whole transaction is recorded under one hold of the file lock, right
@@ -206,7 +212,8 @@ public class MasterTcpServer {
                         errorHolder[0] = store.executeTransaction(
                                 client, transactionCacheApplier, memoryManager::admitTransaction);
                         if (errorHolder[0] == null) {
-                            appendOnlyPersistence.appendAppliedTransaction(appliedCommands(client, commands));
+                            appliedTransaction.addAll(appliedCommands(client, commands));
+                            appendOnlyPersistence.appendAppliedTransaction(appliedTransaction);
                         }
                         return null;
                     });
@@ -214,17 +221,14 @@ public class MasterTcpServer {
 
                     client.endTransaction();
                     if (transactionError == null) {
-                        while(!commands.isEmpty()){
+                        for (String[] applied : appliedTransaction) {
                             // each command is counted and sent as one step, so a replica that asks
                             // to carry on between two of them is resumed at a whole frame. An
                             // expiration is sent in its absolute form, so a replica expiring the
                             // key does not start the clock over on its own. A typed command that
-                            // recorded its own frame - an SPOP written down as the SREM of the
-                            // members it popped - is sent as that frame instead.
-                            String[] queuedCommand = commands.poll();
-                            String[] override = client.transactionPropagation.get(queuedCommand);
-                            propagate(appendOnlyPersistence.replicationFrame(
-                                    override != null ? override : queuedCommand));
+                            // recorded its own frame is already that frame in this list, so it is
+                            // sent as it stands.
+                            propagate(appendOnlyPersistence.replicationFrame(applied));
                         }
                     }
                 }
@@ -251,21 +255,32 @@ public class MasterTcpServer {
     }
 
     /**
-     * The queued commands the transaction really applied, in order.
+     * The queued commands the transaction really applied, in order, as the frames that must
+     * be written down and passed on.
      *
      * <p>A transaction commits the commands that worked and skips the ones the store
-     * refused, so its replies say which those were. Recording a refused command would
-     * write down a change that never happened, and replaying it would fail all over
-     * again against a keyspace that is already correct.</p>
+     * refused, so its replies say which of those were. Recording a refused command would
+     * write down a change that never happened, and replaying it would fail all over again
+     * against a keyspace that is already correct. A command the store applied but that
+     * changed nothing - a {@code DEL} of a key that was not there, an expiration on a
+     * missing key - is not written down either, because there is no change to describe: it
+     * answers a normal reply, so it is recognised from the no-op set the applier filled
+     * rather than from its reply. A read is not a mutation at all, so it is left out. A
+     * typed command that named its own frame, an SPOP written down as the SREM of the
+     * members it popped, is recorded as that frame.</p>
      */
     private List<String[]> appliedCommands(Client client, Queue<String[]> queued) {
         List<String> replies = client.transactionResponse;
         List<String[]> applied = new ArrayList<>(queued.size());
         int index = 0;
         for (String[] command : queued) {
-            if (index < replies.size() && !replies.get(index).startsWith("-")) {
+            boolean refused = index < replies.size() && replies.get(index).startsWith("-");
+            if (!refused && !client.transactionNoOps.contains(command)) {
                 String[] override = client.transactionPropagation.get(command);
-                applied.add(override != null ? override : command);
+                String[] frame = override != null ? override : command;
+                if (AppendOnlyPersistence.isMutation(frame)) {
+                    applied.add(frame);
+                }
             }
             index++;
         }

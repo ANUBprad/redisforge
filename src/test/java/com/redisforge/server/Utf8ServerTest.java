@@ -194,7 +194,7 @@ class Utf8ServerTest {
             client.send(frame("DEL", KEY));
             assertEquals("+QUEUED\r\n", client.readReply());
             client.send(frame("EXEC"));
-            assertEquals("*3\r\n+OK\r\n+OK\r\n+OK\r\n", client.readArrayReply());
+            assertEquals("*3\r\n+OK\r\n+OK\r\n:1\r\n", client.readArrayReply());
 
             client.send(frame("GET", KEY));
             assertEquals("$-1\r\n", client.readReply(), "the transaction's delete did not take effect");

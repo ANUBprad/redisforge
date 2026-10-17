@@ -213,7 +213,7 @@ class ConcurrencyTest {
                 client.send(frame("DEL", "tx:del"));
                 assertEquals("+QUEUED\r\n", client.readReply());
                 client.send(frame("EXEC"));
-                assertEquals("*2\r\n+OK\r\n+OK\r\n", client.readReply(),
+                assertEquals("*2\r\n+OK\r\n:1\r\n", client.readReply(),
                         "the transaction did not answer one reply per queued command");
 
                 client.send(frame("GET", "tx:del"));
@@ -249,7 +249,7 @@ class ConcurrencyTest {
                 client.send(frame("DEL", "mixed:a"));
                 assertEquals("+QUEUED\r\n", client.readReply());
                 client.send(frame("EXEC"));
-                assertEquals("*3\r\n+OK\r\n+OK\r\n+OK\r\n", client.readReply(),
+                assertEquals("*3\r\n+OK\r\n+OK\r\n:1\r\n", client.readReply(),
                         "the mixed transaction did not answer one reply per queued command");
 
                 client.send(frame("GET", "mixed:a"));

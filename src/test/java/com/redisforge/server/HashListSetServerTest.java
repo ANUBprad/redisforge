@@ -176,6 +176,7 @@ class HashListSetServerTest {
             client.send(frame("SADD", "srv:txspop", "only")).readReply();
         }
         int before = frames().size();
+        long streamMark = redisConfig.getMasterReplOffset();
         try (RespSocket client = new RespSocket(masterPort)) {
             client.send(frame("MULTI")).readReply();
             assertEquals("QUEUED", client.send(frame("SPOP", "srv:txspop")).readReply());
@@ -187,6 +188,15 @@ class HashListSetServerTest {
         assertEquals("MULTI", written.get(0)[0]);
         assertEquals("SREM", written.get(1)[0], "a SPOP inside a transaction was not written down as SREM");
         assertEquals("only", written.get(1)[2]);
+
+        List<String[]> propagated = propagatedSince(streamMark);
+        assertEquals(1, propagated.size(),
+                "the transaction passed on something other than its one pop: " + propagated.size());
+        assertEquals("SREM", propagated.get(0)[0],
+                "a SPOP inside a transaction was passed to replicas raw: "
+                        + String.join(" ", propagated.get(0)));
+        assertEquals("srv:txspop", propagated.get(0)[1]);
+        assertEquals("only", propagated.get(0)[2]);
     }
 
     @Test
@@ -246,6 +256,20 @@ class HashListSetServerTest {
     private List<String[]> framesSince(int mark) {
         List<String[]> all = frames();
         return all.subList(mark, all.size());
+    }
+
+    /** The frames the master passed to replicas since the stream stood at this offset. */
+    private List<String[]> propagatedSince(long fromOffset) {
+        byte[] bytes = redisConfig.getReplicationBacklog().read(fromOffset);
+        List<String[]> frames = new ArrayList<>();
+        int offset = 0;
+        while (offset < bytes.length) {
+            int length = respSerializer.frameLength(bytes, offset, bytes.length);
+            assertTrue(length > 0, "the replication stream has a partial frame at " + offset);
+            frames.addAll(respSerializer.deseralize(bytes, offset, offset + length));
+            offset += length;
+        }
+        return frames;
     }
 
     private List<String[]> frames() {

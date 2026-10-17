@@ -590,22 +590,22 @@ public class CommandHandler {
                     res = handleIncrCommandTransactional(command, map, localSerializer, localStore);
                     break;
                 case "DEL":
-                    res = handleDelCommandTransactional(command, map, localSerializer, localStore);
+                    res = handleDelCommandTransactional(command, map, localStore, client);
                     break;
                 case "EXPIRE":
-                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIRE");
+                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIRE", client);
                     break;
                 case "PEXPIRE":
-                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIRE");
+                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIRE", client);
                     break;
                 case "EXPIREAT":
-                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIREAT");
+                    res = handleExpireCommandTransactional(command, map, localStore, "EXPIREAT", client);
                     break;
                 case "PEXPIREAT":
-                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIREAT");
+                    res = handleExpireCommandTransactional(command, map, localStore, "PEXPIREAT", client);
                     break;
                 case "PERSIST":
-                    res = handlePersistCommandTransactional(command, map, localStore);
+                    res = handlePersistCommandTransactional(command, map, localStore, client);
                     break;
                 case "TTL":
                     res = handleTtlCommandTransactional(command, map, localStore, false);
@@ -656,6 +656,12 @@ public class CommandHandler {
         Value current = resolveTransactionalValue(key, map, localStore);
         TypedOps.Mutation mutation = TypedOps.mutate(command, current);
         if (mutation.reply().startsWith("-") || !mutation.changed()) {
+            // a refused command is recognisable from its error reply; a command that left
+            // the value as it was answers a normal reply and is remembered as a no-op, so
+            // the transaction records and passes on neither
+            if (!mutation.reply().startsWith("-")) {
+                rememberNoOp(client, command);
+            }
             return mutation.reply();
         }
         if (mutation.value() == null) {
@@ -679,7 +685,7 @@ public class CommandHandler {
      * commits, exactly as the same command would outside one.
      */
     private String handleExpireCommandTransactional(String[] command, Map<String, Value> map,
-                                                    Store localStore, String kind) {
+                                                    Store localStore, String kind, Client client) {
         if (command.length != 3) {
             return wrongNumberOfArguments(kind.toLowerCase(Locale.ROOT));
         }
@@ -691,6 +697,9 @@ public class CommandHandler {
         }
         Value value = resolveTransactionalValue(command[1], map, localStore);
         if (value == null) {
+            // the key is not there, so nothing was expired: the refused command is not
+            // written down or passed on
+            rememberNoOp(client, command);
             return respSerializer.respInteger(0);
         }
         LocalDateTime now = LocalDateTime.now();
@@ -716,12 +725,15 @@ public class CommandHandler {
         return respSerializer.respInteger(1);
     }
 
-    private String handlePersistCommandTransactional(String[] command, Map<String, Value> map, Store localStore) {
+    private String handlePersistCommandTransactional(String[] command, Map<String, Value> map,
+                                                     Store localStore, Client client) {
         if (command.length != 2) {
             return wrongNumberOfArguments("persist");
         }
         Value value = resolveTransactionalValue(command[1], map, localStore);
         if (value == null || value.expiry.equals(LocalDateTime.MAX)) {
+            // there was no deadline to remove, so nothing changed
+            rememberNoOp(client, command);
             return respSerializer.respInteger(0);
         }
         value.expiry = LocalDateTime.MAX;
@@ -752,27 +764,46 @@ public class CommandHandler {
         return respSerializer.respInteger(millis ? remaining : Store.roundedSeconds(remaining));
     }
 
-    private String handleDelCommandTransactional(String[] command, Map<String, Value> map, RespSerializer localSerializer, Store localStore) {
-        if (command.length != 2) {
+    /**
+     * A queued {@code DEL}, applied to the transaction's view of every key it names.
+     *
+     * <p>It removes each key that is there and answers with how many it actually removed,
+     * the same count the standalone command answers: a key that is not there, or that an
+     * earlier command in the same transaction already removed, is skipped and not counted.
+     * A delete that removed nothing changed nothing, so it is remembered as a no-op and is
+     * neither written down nor passed on.</p>
+     */
+    private String handleDelCommandTransactional(String[] command, Map<String, Value> map,
+                                                 Store localStore, Client client) {
+        if (command.length < 2) {
             return wrongNumberOfArguments("del");
         }
-        String key = command[1];
-        Value valueToUse;
-        Value cachedValue = map.getOrDefault(key, null);
-        if(cachedValue==null){
-            Value storeValue = localStore.getValue(key);
-            if(storeValue == null){
-                //both are null
-                return "-ERR deleting and invalid key\r\n";
-            }else{
-                valueToUse = storeValue.copy();
+        int deleted = 0;
+        for (int i = 1; i < command.length; i++) {
+            String key = command[i];
+            Value cached = map.get(key);
+            Value current = cached != null
+                    ? (cached.isDeletedInTransaction ? null : cached)
+                    : localStore.getValue(key);
+            if (current == null) {
+                continue;
             }
-        }else{
-            valueToUse = cachedValue;
+            Value tombstone = cached != null ? cached : current.copy();
+            tombstone.isDeletedInTransaction = true;
+            map.put(key, tombstone);
+            deleted++;
         }
-        valueToUse.isDeletedInTransaction =true;
-        map.put(key, valueToUse);
-        return "+OK\r\n";
+        if (deleted == 0) {
+            rememberNoOp(client, command);
+        }
+        return respSerializer.respInteger(deleted);
+    }
+
+    /** Records a queued command that was applied but changed nothing. */
+    private static void rememberNoOp(Client client, String[] command) {
+        if (client != null) {
+            client.transactionNoOps.add(command);
+        }
     }
 
     private String handleIncrCommandTransactional(

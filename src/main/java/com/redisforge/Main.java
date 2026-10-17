@@ -1,3 +1,5 @@
+package com.redisforge;
+
 import com.redisforge.persistence.AppendOnlyPersistence;
 import com.redisforge.server.MasterTcpServer;
 import com.redisforge.server.RedisConfig;

@@ -571,11 +571,19 @@ class ChainedReplicationTest {
         try (RespSocket stalled = new RespSocket(replicaPort, 8 * 1024)) {
             register(stalled);
 
-            // never read. More than the outbound buffer holds, well past it, and the frames
-            // keep arriving: the queue has to overflow and the replica has to go
+            // Never read, and write far more than every buffer that can stand between the
+            // propagating thread and the replica can hold: the 2 MiB outbound queue plus
+            // whatever the kernel's auto-tuned TCP send buffer absorbs (tcp_wmem allows
+            // several MiB per socket on a default Linux, and a flood only slightly larger
+            // than the queue alone can be soaked up there without the queue ever seeing
+            // the overflow this test is about). 16 MiB clears the queue bound and any
+            // plausible kernel buffering with room to spare.
             ByteArrayOutputStream upstream = new ByteArrayOutputStream();
-            for (int i = 0; i < 4_000; i++) {
-                upstream.writeBytes(frame("SET", "chain:flood", "v".repeat(1024)));
+            byte[] one = frame("SET", "chain:flood", "v".repeat(1024));
+            long flooded = 0;
+            while (flooded < 16L * 1024 * 1024) {
+                upstream.writeBytes(one);
+                flooded += one.length;
             }
             feed(upstream.toByteArray());
 

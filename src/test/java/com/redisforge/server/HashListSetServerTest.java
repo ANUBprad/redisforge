@@ -24,7 +24,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -117,6 +119,43 @@ class HashListSetServerTest {
         assertEquals(Value.Kind.HASH, store.peekValue("srv:exphash").kind);
         assertEquals(Value.Kind.HASH, replayIntoNewStore().peekValue("srv:exphash").kind,
                 "the hash did not come back as a hash after a restart");
+    }
+
+    @Test
+    void everyTypedKindComesBackWithItsContentsAndDeadline() throws Exception {
+        try (RespSocket client = new RespSocket(masterPort)) {
+            assertEquals(2L, client.send(frame("HSET", "srv:r:hash", "f1", "v1", "f2", "v2")).readReply());
+            assertEquals(3L, client.send(frame("RPUSH", "srv:r:list", "a", "b", "c")).readReply());
+            assertEquals(3L, client.send(frame("SADD", "srv:r:set", "x", "y", "z")).readReply());
+            assertEquals(1L, client.send(frame("EXPIRE", "srv:r:hash", "1000")).readReply());
+            assertEquals(1L, client.send(frame("PEXPIRE", "srv:r:list", "1000000")).readReply());
+        }
+        // the deadlines the live store worked out, so the replay can be held to the same
+        // instants rather than to a deadline that merely looks about right
+        Long hashDeadline = store.absoluteExpiryMillis(store.peekValue("srv:r:hash"));
+        Long listDeadline = store.absoluteExpiryMillis(store.peekValue("srv:r:list"));
+
+        Store replayed = replayIntoNewStore();
+
+        Value hash = replayed.peekValue("srv:r:hash");
+        assertEquals(Value.Kind.HASH, hash.kind, "the hash did not come back as a hash");
+        assertEquals("v1", hash.hash.get("f1"), "a hash field did not survive the restart");
+        assertEquals("v2", hash.hash.get("f2"), "a hash field did not survive the restart");
+        assertEquals(hashDeadline, replayed.absoluteExpiryMillis(hash),
+                "the hash's deadline was restarted rather than kept");
+
+        Value list = replayed.peekValue("srv:r:list");
+        assertEquals(Value.Kind.LIST, list.kind, "the list did not come back as a list");
+        assertEquals(Arrays.asList("a", "b", "c"), new ArrayList<>(list.list),
+                "the list's order or contents did not survive the restart");
+        assertEquals(listDeadline, replayed.absoluteExpiryMillis(list),
+                "the list's deadline was restarted rather than kept");
+
+        Value set = replayed.peekValue("srv:r:set");
+        assertEquals(Value.Kind.SET, set.kind, "the set did not come back as a set");
+        assertEquals(Set.of("x", "y", "z"), new HashSet<>(set.set),
+                "the set's members did not survive the restart");
+        assertNull(replayed.absoluteExpiryMillis(set), "a set with no deadline came back with one");
     }
 
     @Test

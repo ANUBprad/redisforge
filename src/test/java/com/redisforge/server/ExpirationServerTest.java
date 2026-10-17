@@ -218,6 +218,31 @@ class ExpirationServerTest {
     }
 
     @Test
+    void aSetWithARelativeExpiryTravelsToReplicasAsItsAbsoluteDeadline() throws Exception {
+        long streamMark = redisConfig.getMasterReplOffset();
+        try (RespSocket client = new RespSocket(masterPort)) {
+            client.send(frame("SET", "exp:stream", "v", "px", "600000"));
+            assertEquals("+OK", client.readReply());
+        }
+
+        long deadline = store.getValue("exp:stream").expiry
+                .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
+
+        List<String[]> propagated = propagatedSince(streamMark);
+        assertEquals(1, propagated.size(),
+                "a SET was not passed to replicas exactly once: " + propagated);
+        String[] frame = propagated.get(0);
+        assertEquals(5, frame.length);
+        assertEquals("SET", frame[0]);
+        assertEquals("exp:stream", frame[1]);
+        assertEquals("v", frame[2]);
+        assertEquals("PXAT", frame[3],
+                "a relative expiry travelled to replicas as it arrived: " + String.join(" ", frame));
+        assertTrue(Math.abs(Long.parseLong(frame[4]) - deadline) < 2_000,
+                "the deadline passed to replicas is not the one the store is holding");
+    }
+
+    @Test
     void anExpirationInsideATransactionIsAppliedAtExecAndWritten() throws Exception {
         try (RespSocket client = new RespSocket(masterPort)) {
             client.send(frame("SET", "exp:tx", "v"));
@@ -321,6 +346,20 @@ class ExpirationServerTest {
     private List<String[]> framesSince(int mark) {
         List<String[]> all = frames();
         return all.subList(mark, all.size());
+    }
+
+    /** The frames the master passed to replicas since the stream stood at this offset. */
+    private List<String[]> propagatedSince(long fromOffset) {
+        byte[] bytes = redisConfig.getReplicationBacklog().read(fromOffset);
+        List<String[]> frames = new ArrayList<>();
+        int offset = 0;
+        while (offset < bytes.length) {
+            int length = respSerializer.frameLength(bytes, offset, bytes.length);
+            assertTrue(length > 0, "the replication stream has a partial frame at " + offset);
+            frames.addAll(respSerializer.deseralize(bytes, offset, offset + length));
+            offset += length;
+        }
+        return frames;
     }
 
     private List<String[]> frames() {

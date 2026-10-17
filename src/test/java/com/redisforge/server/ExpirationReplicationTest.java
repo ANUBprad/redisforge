@@ -100,6 +100,37 @@ class ExpirationReplicationTest {
     }
 
     @Test
+    void anAbsoluteDeadlineOnASetFromTheMasterIsAppliedAndPassedOn() throws Exception {
+        try (RespSocket downstream = new RespSocket(replicaPort)) {
+            register(downstream);
+            store.map.remove("rexpire:setpxat");
+
+            long deadline = System.currentTimeMillis() + 100_000;
+            feed(frame("SET", "rexpire:setpxat", "v", "PXAT", String.valueOf(deadline)));
+
+            assertTrue(store.peekValue("rexpire:setpxat") != null, "the set was not applied");
+            long applied = store.peekValue("rexpire:setpxat").expiry
+                    .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+            assertEquals(deadline, applied, 5, "the replica did not keep the master's absolute deadline");
+
+            List<String[]> received = downstream.readFramesUntilAck();
+            assertEquals(1, received.size(), "the set was not passed on once: " + received);
+            assertArrayEquals(new String[]{"SET", "rexpire:setpxat", "v", "PXAT", String.valueOf(deadline)},
+                    received.get(0));
+        }
+    }
+
+    @Test
+    void aSetWhoseAbsoluteDeadlineHasPassedRemovesTheKey() throws Exception {
+        store.set("rexpire:stale", "old");
+        feed(frame("SET", "rexpire:stale", "v", "PXAT",
+                String.valueOf(System.currentTimeMillis() - 1_000)));
+
+        assertNull(store.peekValue("rexpire:stale"),
+                "a set whose deadline had already passed left the key holding");
+    }
+
+    @Test
     void persistingFromTheMasterIsAppliedAndPassedOn() throws Exception {
         try (RespSocket downstream = new RespSocket(replicaPort)) {
             register(downstream);

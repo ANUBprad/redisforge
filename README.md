@@ -444,6 +444,13 @@ with `-READONLY`. `BGREWRITEAOF` is recognized but refused with
   replaces its keyspace with the master's live keys, keeping each key's type and its
   remaining deadline, and the stream that follows keeps it in step from there. An older
   string-only snapshot is still accepted and installed as the strings it holds.
+- A write reaches replicas in the same absolute form the file keeps. An expiration travels
+  as the `PEXPIREAT` (or a `PERSIST`, or the `DEL` of a key the expiration removed) that
+  reproduces what the store ended up with, and a `SET` carrying a relative `PX` travels as
+  a `SET` carrying the absolute deadline as `PXAT`. A replica hangs the master's deadline on
+  the key instead of counting the delay again from its own clock, so a key expires on every
+  replica at the instant it expires on the master, and the stream and the file never
+  describe the same write differently.
 - No failover: a master that goes away is not replaced, and there is no Sentinel or
   Cluster support.
 - No authentication and no TLS. Any client that can reach the port has full access.

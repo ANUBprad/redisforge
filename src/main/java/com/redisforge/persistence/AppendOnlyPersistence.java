@@ -518,18 +518,15 @@ public class AppendOnlyPersistence {
     }
 
     /**
-     * The frame an applied expiration command is propagated as: the same absolute form
-     * the file keeps, so a replica expires the key at the instant the master did rather
-     * than counting the delay again from its own clock.
+     * The frame an applied command is propagated as: exactly the frame the file keeps, so
+     * a replica's stream and a replay describe the same write and a replica expires a key
+     * at the instant the master did rather than counting the delay again from its own
+     * clock. That means an expiration travels as its absolute {@code PEXPIREAT} (or a
+     * {@code PERSIST} or {@code DEL}) and a {@code SET} carrying a relative {@code PX}
+     * travels as a {@code SET} carrying the absolute {@code PXAT} the master worked out.
      */
     public String[] replicationFrame(String[] command) {
-        String name = command[0].toUpperCase();
-        if (name.equals("EXPIRE") || name.equals("PEXPIRE")
-                || name.equals("EXPIREAT") || name.equals("PEXPIREAT")
-                || name.equals("PERSIST")) {
-            return expirationFrame(command[1]);
-        }
-        return command;
+        return frameFor(command);
     }
 
     /** null when the key does not expire. */

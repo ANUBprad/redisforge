@@ -440,11 +440,10 @@ public class MasterTcpServer {
                         String set = commandHandler.set(command);
                         if (set.startsWith("+")) {
                             // the store has the deadline the command asked for, so the entry
-                            // can be written with an absolute one
+                            // can be written with an absolute one and the same frame passed on
                             appendOnlyPersistence.appendApplied(command);
+                            propagate(appendOnlyPersistence.replicationFrame(command));
                         }
-                        // on this thread, so replicas receive writes in the order they arrived
-                        propagate(command);
                         return set;
                     });
                 }

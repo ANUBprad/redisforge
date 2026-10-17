@@ -22,6 +22,9 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -385,7 +388,7 @@ public class SlaveTcpServer {
                 // like an apply below, so a resync of a downstream replica that serializes
                 // this store can never part its keyspace from the stream that follows it
                 applyFromMaster(() -> {
-                    commandHandler.set(command);
+                    applySetFromMaster(command);
                     passOn(command);
                 });
                 break;
@@ -441,6 +444,36 @@ public class SlaveTcpServer {
         synchronized (redisConfig.getReplicationBacklog()) {
             apply.run();
         }
+    }
+
+    /**
+     * Applies a {@code SET} the master made, and the deadline that came with it.
+     *
+     * <p>A plain {@code SET} and a {@code SET} carrying a relative {@code PX} are applied
+     * as they arrived. A {@code SET} carrying an absolute {@code PXAT} - the form the
+     * master's stream uses once it has worked out the deadline itself - hangs that same
+     * deadline on the key instead of counting the delay again from this replica's clock,
+     * so the key expires here at the instant it expires on the master. A deadline already
+     * in the past removes the key, exactly as a replay of the same frame would.</p>
+     */
+    private void applySetFromMaster(String[] command) {
+        if (command.length != 5 || !command[3].equalsIgnoreCase("PXAT")) {
+            commandHandler.set(command);
+            return;
+        }
+        long deadline;
+        try {
+            deadline = Long.parseLong(command[4]);
+        } catch (NumberFormatException unreadable) {
+            logger.log(Level.WARNING, "ignored a SET with an unreadable deadline: " + command[4]);
+            return;
+        }
+        if (LocalDateTime.ofInstant(Instant.ofEpochMilli(deadline), ZoneId.systemDefault())
+                .isBefore(LocalDateTime.now())) {
+            store.delete(command[1]);
+            return;
+        }
+        store.setAt(command[1], command[2], deadline);
     }
 
     /**

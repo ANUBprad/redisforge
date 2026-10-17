@@ -1,0 +1,199 @@
+name: cd
+
+# Continuous delivery to Azure Container Apps.
+#
+# Production is deployed only when the ci workflow has finished successfully for a
+# push to main, and it is always deployed from the exact immutable sha-<commit> image
+# that build published - never from a moving tag. A manual run can deploy a specific
+# tag, which is also how a known-good earlier build is rolled back.
+on:
+  workflow_run:
+    workflows: [ "ci" ]
+    types: [ completed ]
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (a tag such as sha-<commit> or v1.2.3). Defaults to the current commit."
+        required: false
+        type: string
+      revision_suffix:
+        description: "Optional Azure Container Apps revision suffix (lowercase letters, digits, dashes)."
+        required: false
+        type: string
+
+# Nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+# One production deployment at a time. A queued run starts after the running one
+# finishes, so two deployments never overlap; it is deliberate that a run in progress
+# is not cancelled, because half a rollout is worse than a late one.
+concurrency:
+  group: redisforge-cd-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    # A workflow_run event fires for every conclusion, so a failing ci run must be
+    # filtered out here; only a successful push to main - never a pull request - deploys.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.app_url }}
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_CONTAINERAPP_NAME: ${{ vars.AZURE_CONTAINERAPP_NAME }}
+      AZURE_CONTAINER_NAME: ${{ vars.AZURE_CONTAINER_NAME }}
+      SMOKE_TEST_MODE: ${{ vars.SMOKE_TEST_MODE }}
+    steps:
+      - name: Check out the exact commit being deployed
+        uses: actions/checkout@v4
+        with:
+          # For a workflow_run the source is the commit that ci just built; for a
+          # manual run it is the ref the run was started from.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve the immutable image to deploy
+        id: image
+        run: |
+          set -euo pipefail
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_run" ]; then
+            tag="sha-${{ github.event.workflow_run.head_sha }}"
+          elif [ -n "${{ inputs.image_tag }}" ]; then
+            tag="${{ inputs.image_tag }}"
+          else
+            tag="sha-${{ github.sha }}"
+          fi
+          # A revision suffix must be lowercase letters, digits and dashes, and is
+          # derived from the tag so the same image always maps to the same revision.
+          suffix=$(echo "${tag}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' \
+            | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "suffix=${suffix}" >> "$GITHUB_OUTPUT"
+          echo "ref=ghcr.io/${repo}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "Deploying ghcr.io/${repo}:${tag} as revision suffix '${suffix}'"
+
+      - name: Fail early if the deployment settings are missing
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in AZURE_RESOURCE_GROUP AZURE_CONTAINERAPP_NAME AZURE_CONTAINER_NAME; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Repository variable ${name} is not set"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Is this image already the deployed one?
+        id: guard
+        run: |
+          set -euo pipefail
+          current=$(az containerapp show \
+            --name "${AZURE_CONTAINERAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "current image: ${current}"
+          if [ "${current}" = "${{ steps.image.outputs.ref }}" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "The requested image is already the active template; nothing to do."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record the outgoing revision for rollback
+        id: previous
+        if: steps.guard.outputs.already != 'true'
+        run: |
+          set -euo pipefail
+          previous=$(az containerapp show \
+            --name "${AZURE_CONTAINERAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+          echo "Previous image (rollback target): ${previous}"
+
+      - name: Update the container app to the new image
+        id: deploy
+        if: steps.guard.outputs.already != 'true'
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "${AZURE_CONTAINERAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --image "${{ steps.image.outputs.ref }}" \
+            --revision-suffix "${{ inputs.revision_suffix || steps.image.outputs.suffix }}"
+          fqdn=$(az containerapp show \
+            --name "${AZURE_CONTAINERAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "app_url=https://${fqdn}" >> "$GITHUB_OUTPUT"
+          echo "app_fqdn=${fqdn}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the new revision to become healthy
+        if: steps.guard.outputs.already != 'true'
+        run: |
+          set -euo pipefail
+          fqdn="${{ steps.deploy.outputs.app_fqdn }}"
+          for attempt in $(seq 1 30); do
+            state=$(az containerapp revision list \
+              --name "${AZURE_CONTAINERAPP_NAME}" \
+              --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --query "[?properties.trafficWeight>\`0\`].properties.runningState | [0]" \
+              -o tsv)
+            echo "attempt ${attempt}: running state = ${state:-<none>}"
+            if [ "${state}" = "Running" ] || [ "${state}" = "RunningAtMaxScale" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the new revision did not become healthy within five minutes"
+          exit 1
+
+      - name: Smoke test the deployed service
+        if: steps.guard.outputs.already != 'true' && env.SMOKE_TEST_MODE != 'skip'
+        run: |
+          set -euo pipefail
+          if [ "${SMOKE_TEST_MODE:-in-container}" = "external" ]; then
+            # Use this when the runner (a self-hosted runner or a jump box) can reach
+            # the app's private TCP port. SMOKE_TEST_HOST and SMOKE_TEST_PORT come from
+            # repository variables.
+            bash scripts/azure/smoke-test.sh "${{ vars.SMOKE_TEST_HOST }}" "${SMOKE_TEST_PORT:-6379}"
+          else
+            # The default: a RESP PING sent from inside the container to its own
+            # loopback port, which needs no VNet access. It proves the server accepted
+            # a TCP connection and answered a real command on the revision just rolled out.
+            bash scripts/azure/in-container-smoke.sh \
+              "${AZURE_CONTAINERAPP_NAME}" "${AZURE_RESOURCE_GROUP}" "${AZURE_CONTAINER_NAME}"
+          fi
+
+      - name: Report the outcome
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo ""
+            echo "- Image: \`${{ steps.image.outputs.ref }}\`"
+            echo "- Revision suffix: \`${{ inputs.revision_suffix || steps.image.outputs.suffix }}\`"
+            echo "- Skipped (already deployed): ${{ steps.guard.outputs.already }}"
+            echo "- App URL: ${{ steps.deploy.outputs.app_url }}"
+            echo ""
+            if [ "${{ steps.guard.outputs.already }}" != "true" ]; then
+              echo "To roll back, run this workflow again with:"
+              echo '```'
+              echo "image_tag: ${{ steps.previous.outputs.previous }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

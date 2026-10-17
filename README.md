@@ -73,12 +73,29 @@ test suite.
 mvn test
 ```
 
-## Continuous integration
+## Continuous integration and delivery
 
-On every push to `main` and every pull request, the GitHub Actions workflow in
-[`.github/workflows/build.yml`](.github/workflows/build.yml) runs `mvn clean test` and
-then packages the jar with `mvn package -DskipTests`, uploading the surefire reports as
-an artifact.
+The GitHub Actions pipeline is split so that a pull request can prove the build without
+being able to publish or deploy anything:
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull request and on
+  every push to `main` (and on `v*` tags). It runs the full test suite with Java 23 and
+  `mvn clean verify`, uploads the surefire reports on failure, lints and renders the Helm
+  chart, and builds the production Docker image. On a push to `main` or a version tag it
+  also publishes the image to the GitHub Container Registry as
+  `ghcr.io/<owner>/redisforge`, tagged with an immutable `sha-<commit>` alongside the
+  branch, tag and `latest` tags. Pull requests build the image but never push it, and only
+  the `publish` job is granted `packages: write`.
+- [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys to Azure Container
+  Apps only after a `ci` run on `main` has finished successfully. It always deploys the
+  exact `sha-<commit>` image that build published - never a moving `latest` tag - behind a
+  protected `production` environment, and serialises deploys so two never overlap. It can
+  also be run manually with an earlier `image_tag`, which is how a known-good build is
+  rolled back. See [`deploy/azure/README.md`](deploy/azure/README.md) for the Azure setup,
+  cost, persistence limits, smoke tests and cleanup.
+
+Because RedisForge has no AUTH or TLS, the deployed service uses **internal** TCP ingress
+only and is never exposed to the public internet.
 
 ## Run
 
@@ -229,14 +246,14 @@ hash, list or set, and the typed reads do the same against a string.
 
 ## Benchmark
 
-[`src/test/java/com/redisforge/benchmark/BenchmarkMain.java`](src/test/java/Components/Benchmark/BenchmarkMain.java)
+[`src/test/java/com/redisforge/benchmark/BenchmarkMain.java`](src/test/java/com/redisforge/benchmark/BenchmarkMain.java)
 is a plain-JDK harness in the test tree that hammers a RedisForge server that is already
 up. It is deliberately not a JUnit test, so `mvn test` does not run it. Point it at a
 running server:
 
 ```sh
 mvn test-compile
-java -cp target/test-classes Components.Benchmark.BenchmarkMain [host] [port]
+java -cp target/test-classes com.redisforge.benchmark.BenchmarkMain [host] [port]
 ```
 
 It measures what a real client socket sees: 50,000 sequential `SET` and `GET` round
@@ -476,14 +493,17 @@ with `-READONLY`. `BGREWRITEAOF` is recognized but refused with
 ## Project layout
 
 ```
-src/main/java/Main.java           entry point and argument parsing
-src/main/java/Config              Spring configuration used for dependency injection
-src/main/java/Components/Server   master and replica TCP servers
-src/main/java/Components/Service  RESP codec and command handling
-src/main/java/Components/Repository  keyspace storage
-src/main/java/Components/Persistence  append-only file writing, replay and fsync
-src/main/java/Components/Infra    connection and replica tracking
-helm/redisforge                   Helm chart
+src/main/java/com/redisforge/Main.java          entry point and argument parsing
+src/main/java/com/redisforge/config             Spring configuration used for dependency injection
+src/main/java/com/redisforge/server             master and replica TCP servers
+src/main/java/com/redisforge/command            command execution and transaction semantics
+src/main/java/com/redisforge/protocol           RESP codec
+src/main/java/com/redisforge/store              keyspace, typed values, expiry and memory policy
+src/main/java/com/redisforge/persistence        append-only file writing, replay and fsync
+src/main/java/com/redisforge/replication        replica connections and the replication backlog
+src/main/java/com/redisforge/network            socket client primitives
+helm/redisforge                                 Helm chart
+deploy/azure                                    Azure Container Apps provisioning and smoke tests
 ```
 
 Spring is used only as a dependency-injection container; the server itself is built on

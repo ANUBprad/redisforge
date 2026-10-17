@@ -170,7 +170,7 @@ jobs:
             # Use this when the runner (a self-hosted runner or a jump box) can reach
             # the app's private TCP port. SMOKE_TEST_HOST and SMOKE_TEST_PORT come from
             # repository variables.
-            bash scripts/azure/smoke-test.sh "${{ vars.SMOKE_TEST_HOST }}" "${SMOKE_TEST_PORT:-6379}"
+            bash scripts/azure/smoke-test.sh "${{ vars.SMOKE_TEST_HOST }}" "${{ vars.SMOKE_TEST_PORT || '6379' }}"
           else
             # The default: a RESP PING sent from inside the container to its own
             # loopback port, which needs no VNet access. It proves the server accepted

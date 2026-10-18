@@ -28,12 +28,21 @@ Expected response: `PONG`.
 To enable AOF persistence locally, create a directory and mount it into the container:
 
 ```sh
-mkdir -p redisforge-data
-docker run --rm --name redisforge \
-  -p 127.0.0.1:6379:6379 \
-  -v "$PWD/redisforge-data:/data" \
-  redisforge:local \
+# PowerShell (Windows)
+New-Item -ItemType Directory -Force redisforge-data | Out-Null
+docker run --rm --name redisforge `
+  -p 127.0.0.1:6379:6379 `
+  -v "${PWD}/redisforge-data:/data" `
+  redisforge:local `
   --appendonly yes --appendfilename /data/appendonly.aof
+
+# Bash (Linux/macOS)
+# mkdir -p redisforge-data
+# docker run --rm --name redisforge \
+#   -p 127.0.0.1:6379:6379 \
+#   -v "$PWD/redisforge-data:/data" \
+#   redisforge:local \
+#   --appendonly yes --appendfilename /data/appendonly.aof
 ```
 
 Keep the data directory backed up if you care about the contents. AOF is a persistence mechanism, not a backup strategy.

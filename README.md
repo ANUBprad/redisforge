@@ -75,27 +75,15 @@ mvn test
 
 ## Continuous integration and delivery
 
-The GitHub Actions pipeline is split so that a pull request can prove the build without
-being able to publish or deploy anything:
+The GitHub Actions pipeline provides automated checks and container publishing without a cloud subscription:
 
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull request and on
-  every push to `main` (and on `v*` tags). It runs the full test suite with Java 23 and
-  `mvn clean verify`, uploads the surefire reports on failure, lints and renders the Helm
-  chart, and builds the production Docker image. On a push to `main` or a version tag it
-  also publishes the image to the GitHub Container Registry as
-  `ghcr.io/<owner>/redisforge`, tagged with an immutable `sha-<commit>` alongside the
-  branch, tag and `latest` tags. Pull requests build the image but never push it, and only
-  the `publish` job is granted `packages: write`.
-- [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys to Azure Container
-  Apps only after a `ci` run on `main` has finished successfully. It always deploys the
-  exact `sha-<commit>` image that build published - never a moving `latest` tag - behind a
-  protected `production` environment, and serialises deploys so two never overlap. It can
-  also be run manually with an earlier `image_tag`, which is how a known-good build is
-  rolled back. See [`deploy/azure/README.md`](deploy/azure/README.md) for the Azure setup,
-  cost, persistence limits, smoke tests and cleanup.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pull requests and pushes to `main` (and `v*` tags). It runs the full test suite with Java 23 and `mvn clean verify`, uploads Surefire reports on failure, lints and renders the Helm chart, and builds the production Docker image.
+- On pushes to `main` and version tags, the workflow publishes an immutable `sha-<commit>` image to GitHub Container Registry at `ghcr.io/anubprad/redisforge`, alongside readable branch/version tags. Pull requests build but never publish.
+- Because this is a public repository, standard GitHub-hosted Actions runners and public-repository package publishing fit the free workflow. No Azure/AWS/GCP account or cloud billing setup is required.
 
-Because RedisForge has no AUTH or TLS, the deployed service uses **internal** TCP ingress
-only and is never exposed to the public internet.
+RedisForge is a raw TCP service, not an HTTP web app. Free web-hosting platforms often cannot expose arbitrary TCP ports, and many cloud free tiers have billing or credit-expiry requirements. To respect a strict zero-billing preference, this repository intentionally has **no automatic cloud deployment**. Run it locally with Docker, or see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the free options review and safe local run commands.
+
+RedisForge currently has no AUTH or TLS. Keep port 6379 bound to localhost or a trusted private network; never expose it to the public internet.
 
 ## Run
 

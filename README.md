@@ -491,7 +491,7 @@ src/main/java/com/redisforge/persistence        append-only file writing, replay
 src/main/java/com/redisforge/replication        replica connections and the replication backlog
 src/main/java/com/redisforge/network            socket client primitives
 helm/redisforge                                 Helm chart
-deploy/azure                                    Azure Container Apps provisioning and smoke tests
+docs/DEPLOYMENT.md                              zero-billing deployment options and local Docker guide
 ```
 
 Spring is used only as a dependency-injection container; the server itself is built on
